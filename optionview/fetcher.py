@@ -1,7 +1,7 @@
 """Market data retrieval from free public APIs.
 
-Uses Yahoo Finance (via yfinance) to fetch live option chains
-and underlying asset data without requiring authentication.
+Uses Yahoo Finance (via yfinance) to fetch live option chains,
+spot prices, and dividend yield data without requiring authentication.
 """
 
 from dataclasses import dataclass
@@ -59,7 +59,7 @@ def fetch_option_chain(
         if expiration not in expirations:
             raise ValueError(
                 f"Expiration '{expiration}' not available for '{ticker}'. "
-                f"Available: {', '.join(expirations[:5])}..."
+                f"Available: {list(expirations[:5])}..."
             )
         target_exp = expiration
     else:
@@ -108,6 +108,56 @@ def fetch_spot_price(ticker: str) -> float:
         raise ValueError(f"Could not retrieve spot price for '{ticker}'")
 
     return float(price)
+
+
+def fetch_dividend_yield(ticker: str) -> float:
+    """Fetch the trailing annual dividend yield for a ticker as a decimal.
+
+    Returns the trailing twelve-month dividend yield expressed as a
+    continuous rate approximation, suitable for use as the dividend_yield
+    parameter in the pricing models and Greeks functions.
+
+    The value is sourced from Yahoo Finance's reported trailing annual
+    dividend yield (e.g. 0.015 represents 1.5% annual yield). For stocks
+    that pay no dividends, 0.0 is returned rather than raising an error.
+
+    Note: Yahoo Finance reports a discrete annualized yield; for high-yield
+    securities over short time horizons the continuous approximation is close
+    but not exact. Convert with q_continuous = -log(1 - q_discrete * T) / T
+    if precision over a specific horizon matters.
+
+    Args:
+        ticker: Stock ticker symbol (e.g. "AAPL", "SPY").
+
+    Returns:
+        Trailing annual dividend yield as a decimal (e.g. 0.015 for 1.5%).
+        Returns 0.0 if the ticker pays no dividend or data is unavailable.
+
+    Raises:
+        ValueError: If the ticker symbol is not recognized by Yahoo Finance.
+    """
+    asset = yf.Ticker(ticker)
+
+    try:
+        info = asset.info
+    except Exception as exc:
+        raise ValueError(
+            f"Could not retrieve data for ticker '{ticker}': {exc}"
+        ) from exc
+
+    if not info or info.get("quoteType") is None:
+        raise ValueError(
+            f"Ticker '{ticker}' not recognized. Verify the symbol is valid."
+        )
+
+    # Yahoo Finance may report the yield under either key depending on version
+    yield_value = (
+        info.get("trailingAnnualDividendYield")
+        or info.get("dividendYield")
+        or 0.0
+    )
+
+    return float(yield_value)
 
 
 def list_expirations(ticker: str) -> list[str]:
