@@ -7,9 +7,8 @@ A Python toolkit for comparing option pricing models against real-time market da
 - **Multiple Pricing Models**: Black-Scholes, Binomial Tree, and Monte Carlo simulation
 - **Live Market Data**: Fetches real-time option chains from Yahoo Finance (no API key required)
 - **Model Comparison**: Side-by-side comparison of theoretical vs. market prices
-- **Greeks Calculation**: Delta, Gamma, Theta, Vega, and Rho for each model
+- **Greeks Calculation**: Full analytical Greeks including Delta, Gamma, Theta, Vega, Rho, Epsilon (dividend sensitivity), Vanna, and Charm
 - **Implied Volatility Solver**: Newton-Raphson IV solver with configurable tolerance
-- **Volatility Surface**: Build and analyze the IV surface across strikes and expirations
 - **Clean API**: Simple, composable functions for scripting and analysis
 
 ## Installation
@@ -55,7 +54,9 @@ print(f"Monte Carlo:    ${mc_price:.4f}")
 
 # Fetch live option chain data
 chain = fetch_option_chain("AAPL")
-print(chain[:5])
+print(f"Retrieved {len(chain)} contracts")
+for record in chain[:3]:
+    print(f"  {record.option_type} K={record.strike:.0f} exp={record.expiration} IV={record.implied_volatility:.2%}")
 
 # Compute Greeks
 greeks = compute_greeks(spot, strike, rate, vol, T, "call")
@@ -64,6 +65,53 @@ print(f"Gamma: {greeks['gamma']:.4f}")
 print(f"Theta: {greeks['theta']:.4f}")
 print(f"Vega:  {greeks['vega']:.4f}")
 ```
+
+## Model Comparison
+
+Compare all three pricing models against live market mid-prices and identify
+which model best fits each contract:
+
+```python
+from optionview.compare import compare_to_market
+from optionview.fetcher import fetch_option_chain, fetch_spot_price, fetch_dividend_yield
+
+ticker = "AAPL"
+chain = fetch_option_chain(ticker)
+spot = fetch_spot_price(ticker)
+div_yield = fetch_dividend_yield(ticker)
+rate = 0.05
+
+report = compare_to_market(
+    chain,
+    spot=spot,
+    rate=rate,
+    dividend_yield=div_yield,
+    min_open_interest=50,  # exclude illiquid strikes
+)
+
+print(f"Compared {len(report.results)} contracts, skipped {len(report.skipped)}")
+print(f"Mean absolute error (Black-Scholes): ${report.mean_abs_error['bs']:.4f}")
+print(f"Mean absolute error (Binomial Tree): ${report.mean_abs_error['bt']:.4f}")
+print(f"Mean absolute error (Monte Carlo):   ${report.mean_abs_error['mc']:.4f}")
+print(f"Best model wins: {report.best_model_counts}")
+
+# Inspect individual results
+for result in report.results[:5]:
+    rec = result.record
+    print(
+        f"  {rec.option_type} K={rec.strike:.0f}: "
+        f"market=${result.market_mid:.2f} "
+        f"BS=${result.bs_price:.2f} (err={result.bs_rel_error:+.2%}) "
+        f"best={result.best_model}"
+    )
+```
+
+By default, each contract is evaluated at its own market-implied volatility.
+In this convergence mode, Black-Scholes reproduces the market price exactly
+(by definition of IV), so the comparison quantifies how well Binomial Tree
+and Monte Carlo converge to the analytical benchmark. Pass a uniform
+`volatility` override to evaluate all contracts at the same vol assumption,
+which instead reveals pricing errors driven by the volatility smile.
 
 ## Volatility Surface
 
@@ -99,14 +147,14 @@ for exp, vol in atm.items():
 for summary in surface.smile_summary():
     slope_str = f"{summary.smile_slope:+.3f}" if summary.smile_slope is not None else "n/a"
     print(
-        f"  {summary.expiration}: ATM={summary.atm_iv:.l%} "
+        f"  {summary.expiration}: ATM={summary.atm_iv:.1%} "
         f"slope={slope_str} pts={summary.n_points}"
     )
 
 # Inspect individual smile for a specific expiry
 first_exp = surface.expirations[0]
 for pt in surface.smile(first_exp):
-    print(f"  k={pt.log_moneyness:+.3f}  IV={pt.iv:.l%}  {pt.option_type}  K=pt.strike:.0f}")
+    print(f"  k={pt.log_moneyness:+.3f}  IV={pt.iv:.1%}  {pt.option_type}  K={pt.strike:.0f}")
 ```
 
 The smile slope is the OLS slope of IV regressed on log-moneyness. A negative slope
@@ -140,8 +188,7 @@ Path-based simulation with antithetic variates for variance reduction. Best suit
 ## Roadmap
 
 - HTML dashboard for interactive comparison
-- Support for dividend-adjusted pricing
-- Volatility surface visualization
+- Volatility surface visualization (surface construction is implemented; charting is not)
 - Additional models (Heston, SABR)
 - Portfolio-level Greeks aggregation
 - Historical backtesting of model accuracy
