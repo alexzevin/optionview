@@ -9,6 +9,7 @@ A Python toolkit for comparing option pricing models against real-time market da
 - **Model Comparison**: Side-by-side comparison of theoretical vs. market prices
 - **Greeks Calculation**: Delta, Gamma, Theta, Vega, and Rho for each model
 - **Implied Volatility Solver**: Newton-Raphson IV solver with configurable tolerance
+- **Volatility Surface**: Build and analyze the IV surface across strikes and expirations
 - **Clean API**: Simple, composable functions for scripting and analysis
 
 ## Installation
@@ -54,7 +55,7 @@ print(f"Monte Carlo:    ${mc_price:.4f}")
 
 # Fetch live option chain data
 chain = fetch_option_chain("AAPL")
-print(chain.head())
+print(chain[:5])
 
 # Compute Greeks
 greeks = compute_greeks(spot, strike, rate, vol, T, "call")
@@ -64,6 +65,55 @@ print(f"Theta: {greeks['theta']:.4f}")
 print(f"Vega:  {greeks['vega']:.4f}")
 ```
 
+## Volatility Surface
+
+Build an implied volatility surface from an option chain and analyze the smile structure:
+
+```python
+from optionview.fetcher import fetch_option_chain, fetch_spot_price, list_expirations
+from optionview.surface import build_surface
+
+# Fetch contracts across multiple expirations for a richer surface
+ticker = "SPY"
+expirations = list_expirations(ticker)[:4]  # nearest four expiries
+
+all_records = []
+for exp in expirations:
+    all_records.extend(fetch_option_chain(ticker, expiration=exp))
+
+spot = fetch_spot_price(ticker)
+rate = 0.05
+dividend_yield = 0.013  # ~1.3% SPY yield
+
+surface = build_surface(all_records, spot, rate, dividend_yield, min_open_interest=50)
+
+print(f"Surface built: {len(surface.points)} points across {len(surface.expirations)} expiries")
+print(f"Filtered out: {surface.n_filtered} low-quality records")
+
+# ATM vol term structure
+atm = surface.atm_term_structure()
+for exp, vol in atm.items():
+    print(f"  {exp}: ATM IV = {vol:.1%}")
+
+# Smile analysis per expiry
+for summary in surface.smile_summary():
+    slope_str = f"{summary.smile_slope:+.3f}" if summary.smile_slope is not None else "n/a"
+    print(
+        f"  {summary.expiration}: ATM={summary.atm_iv:.l%} "
+        f"slope={slope_str} pts={summary.n_points}"
+    )
+
+# Inspect individual smile for a specific expiry
+first_exp = surface.expirations[0]
+for pt in surface.smile(first_exp):
+    print(f"  k={pt.log_moneyness:+.3f}  IV={pt.iv:.l%}  {pt.option_type}  K=pt.strike:.0f}")
+```
+
+The smile slope is the OLS slope of IV regressed on log-moneyness. A negative slope
+(IV decreasing with strike) is characteristic of equity index options and reflects
+downside demand. A strongly negative slope across all expirations signals pronounced
+skew, which has implications for delta-hedging books with large gamma exposure.
+
 ## Project Structure
 
 ```
@@ -72,6 +122,8 @@ optionview/
   models.py        - Pricing model implementations
   greeks.py        - Analytical Greeks calculations
   fetcher.py       - Market data retrieval from free APIs
+  surface.py       - Implied volatility surface construction and smile analysis
+  compare.py       - Model-vs-market comparison utilities
 ```
 
 ## Pricing Models
