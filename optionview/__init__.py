@@ -1,6 +1,6 @@
 """optionview - Compare option pricing models against live market data."""
 
-__version__ = "0.1.2"
+__version__ = "0.1.3"
 
 from optionview.models import black_scholes, binomial_tree, monte_carlo, implied_volatility
 from optionview.greeks import compute_greeks
@@ -10,6 +10,12 @@ from optionview.compare import (
     ComparisonResult,
     ComparisonReport,
     SkippedRecord,
+)
+from optionview.surface import (
+    build_surface,
+    VolatilitySurface,
+    IVPoint,
+    SmileSummary,
 )
 
 __all__ = [
@@ -25,4 +31,8 @@ __all__ = [
     "ComparisonResult",
     "ComparisonReport",
     "SkippedRecord",
+    "build_surface",
+    "VolatilitySurface",
+    "IVPoint",
+    "SmileSummary",
 ]
