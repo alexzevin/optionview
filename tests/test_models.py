@@ -524,6 +524,77 @@ class TestVolatilitySurface:
         with pytest.raises(ValueError, match="[Ss]pot"):
             build_surface(records, -1.0, RATE)
 
+    def test_build_surface_iv_from_mid(self) -> None:
+        """use_market_iv=False should solve IV from the bid/ask midpoint.
+
+        _make_record prices the mid using black_scholes at the given vol, so
+        solving IV from that mid (with the same spot, rate, and T) must
+        recover an IV close to the original. The test uses a loose bound
+        because rounding in bid/ask construction introduces a tiny discrepancy.
+        """
+        records = [
+            _make_record(95.0, 60, 0.22),
+            _make_record(100.0, 60, 0.20),
+            _make_record(105.0, 60, 0.18),
+        ]
+        surface = build_surface(records, SPOT, RATE, use_market_iv=False)
+        assert len(surface.points) == 3, (
+            f"Expected 3 points, got {len(surface.points)} (n_filtered={surface.n_filtered})"
+        )
+        assert surface.n_filtered == 0
+        for pt in surface.points:
+            # Solved IV should be in the ballpark of the original vol used in _make_record.
+            # 0.10-0.40 is wide enough to survive the bid/ask rounding without false failures.
+            assert 0.10 < pt.iv < 0.40, (
+                f"Unexpected IV {pt.iv:.4f} for strike {pt.strike}"
+            )
+
+    def test_smile_summary_iv_range_bounds(self) -> None:
+        """iv_range (min_iv, max_iv) must span exactly the min and max IVs for the expiry."""
+        records = [
+            _make_record(90.0, 30, 0.25),
+            _make_record(100.0, 30, 0.20),
+            _make_record(110.0, 30, 0.17),
+        ]
+        surface = build_surface(records, SPOT, RATE)
+        summaries = surface.smile_summary()
+        assert len(summaries) == 1
+        lo, hi = summaries[0].iv_range
+        ivs = [pt.iv for pt in surface.points]
+        assert abs(lo - min(ivs)) < 1e-10, f"iv_range low {lo:.6f} != min IV {min(ivs):.6f}"
+        assert abs(hi - max(ivs)) < 1e-10, f"iv_range high {hi:.6f} != max IV {max(ivs):.6f}"
+
+    def test_smile_summary_slope_negative_for_equity_skew(self) -> None:
+        """Smile slope must be negative when low strikes carry higher IV (put-skew structure).
+
+        This is the canonical equity index shape: downside demand bids up OTM put vol
+        relative to OTM calls. The OLS regression of IV on log-moneyness must produce
+        a negative coefficient whenever IV decreases monotonically with strike.
+        """
+        records = [
+            _make_record(85.0, 60, 0.32, option_type="put"),
+            _make_record(95.0, 60, 0.24),
+            _make_record(100.0, 60, 0.20),
+            _make_record(105.0, 60, 0.18),
+            _make_record(115.0, 60, 0.16),
+        ]
+        surface = build_surface(records, SPOT, RATE)
+        summaries = surface.smile_summary()
+        assert len(summaries) == 1
+        slope = summaries[0].smile_slope
+        assert slope is not None, "smile_slope is None with 5 points"
+        assert slope < 0.0, (
+            f"Expected negative slope for put-skew data, got {slope:.4f}"
+        )
+
+    def test_smile_summary_none_slope_for_single_point(self) -> None:
+        """smile_slope must be None when fewer than two points are available for a given expiry."""
+        records = [_make_record(100.0, 30, 0.20)]
+        surface = build_surface(records, SPOT, RATE)
+        summaries = surface.smile_summary()
+        assert len(summaries) == 1
+        assert summaries[0].smile_slope is None
+
 
 # ---------------------------------------------------------------------------
 # ComparisonReport
@@ -608,3 +679,74 @@ class TestCompareToMarket:
         assert report.mean_abs_error == {"bs": 0.0, "bt": 0.0, "mc": 0.0}
         assert len(report.results) == 0
         assert len(report.skipped) == 0
+
+    def test_surface_mode_uses_uniform_vol(self) -> None:
+        """When a fixed volatility is supplied, every result must record that vol.
+
+        In surface mode, all three models evaluate at the caller-supplied vol
+        rather than per-contract implied volatility. This matters when diagnosing
+        skew or term-structure effects under a flat vol assumption.
+        """
+        records = [
+            _make_record(95.0, 30, 0.20),
+            _make_record(100.0, 30, 0.20),
+            _make_record(105.0, 30, 0.20),
+        ]
+        report = compare_to_market(records, SPOT, RATE, volatility=0.30)
+        assert len(report.results) == 3
+        for result in report.results:
+            assert result.volatility_used == 0.30, (
+                f"Expected volatility_used=0.30, got {result.volatility_used}"
+            )
+        assert report.surface_vol == 0.30
+
+    def test_min_open_interest_filtering_in_compare(self) -> None:
+        """Contracts below min_open_interest must appear in skipped with reason low_open_interest."""
+        low_oi = _make_record(100.0, 30, 0.20, open_interest=5)
+        high_oi = _make_record(105.0, 30, 0.20, open_interest=500)
+        report = compare_to_market([low_oi, high_oi], SPOT, RATE, min_open_interest=10)
+        assert len(report.results) == 1
+        assert report.results[0].record.strike == 105.0
+        assert len(report.skipped) == 1
+        assert report.skipped[0].reason == "low_open_interest"
+
+    def test_zero_iv_skipped_in_convergence_mode(self) -> None:
+        """In per-contract IV mode, a zero implied_volatility contract must be skipped."""
+        from datetime import timedelta
+
+        exp = date.today() + timedelta(days=30)
+        zero_iv = OptionRecord(
+            symbol="TEST",
+            expiration=exp,
+            strike=100.0,
+            option_type="call",
+            last_price=1.0,
+            bid=0.95,
+            ask=1.05,
+            volume=100,
+            open_interest=200,
+            implied_volatility=0.0,
+        )
+        report = compare_to_market([zero_iv], SPOT, RATE)
+        assert len(report.results) == 0
+        assert len(report.skipped) == 1
+        assert report.skipped[0].reason == "zero_implied_volatility"
+
+    def test_best_model_counts_sum_to_result_count(self) -> None:
+        """Total across best_model_counts must equal the number of compared results.
+
+        Each result contributes exactly one vote to the model with the smallest
+        absolute pricing error, so the histogram must be exhaustive and non-overlapping.
+        """
+        records = [
+            _make_record(90.0, 30, 0.22),
+            _make_record(95.0, 30, 0.20),
+            _make_record(100.0, 30, 0.19),
+            _make_record(105.0, 30, 0.21),
+            _make_record(110.0, 30, 0.23),
+        ]
+        report = compare_to_market(records, SPOT, RATE)
+        total_counts = sum(report.best_model_counts.values())
+        assert total_counts == len(report.results), (
+            f"best_model_counts sum {total_counts} != result count {len(report.results)}"
+        )
