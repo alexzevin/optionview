@@ -4,7 +4,12 @@ __version__ = "0.1.3"
 
 from optionview.models import black_scholes, binomial_tree, monte_carlo, implied_volatility
 from optionview.greeks import compute_greeks
-from optionview.fetcher import fetch_option_chain, fetch_spot_price, fetch_dividend_yield
+from optionview.fetcher import (
+    fetch_option_chain,
+    fetch_spot_price,
+    fetch_dividend_yield,
+    list_expirations,
+)
 from optionview.compare import (
     compare_to_market,
     ComparisonResult,
@@ -27,6 +32,7 @@ __all__ = [
     "fetch_option_chain",
     "fetch_spot_price",
     "fetch_dividend_yield",
+    "list_expirations",
     "compare_to_market",
     "ComparisonResult",
     "ComparisonReport",
