@@ -4,8 +4,10 @@ Uses Yahoo Finance (via yfinance) to fetch live option chains,
 spot prices, and dividend yield data without requiring authentication.
 """
 
+import math
 from dataclasses import dataclass
 from datetime import date
+from typing import Any
 
 import yfinance as yf
 
@@ -26,6 +28,54 @@ class OptionRecord:
     implied_volatility: float
 
 
+def _safe_float(val: Any, default: float = 0.0) -> float:
+    """Convert val to float, substituting default for None, NaN, or unconvertible values.
+
+    yfinance DataFrames frequently return numpy NaN for missing option fields (bid,
+    ask, impliedVolatility). Without this guard, float(nan) propagates silently
+    through downstream filters: nan != 0.0, so the zero_market filter fails to catch
+    contracts with no valid quote, and mid-price calculations produce NaN results that
+    corrupt aggregate error statistics in ComparisonReport.
+
+    Args:
+        val: Value to convert. Accepts anything float() can handle.
+        default: Returned when val is None, NaN, or raises on conversion.
+
+    Returns:
+        float(val) when val is a finite number, otherwise default.
+    """
+    try:
+        result = float(val)
+        return default if math.isnan(result) else result
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_int(val: Any, default: int = 0) -> int:
+    """Convert val to int, substituting default for None, NaN, or unconvertible values.
+
+    Guards against yfinance returning NaN for integer fields (volume, open_interest).
+    Calling int(float('nan')) raises ValueError in CPython; this function handles
+    that case without requiring callers to guard against it separately.
+
+    The float intermediate step is intentional: some yfinance versions return
+    numeric strings (e.g., "150") or float-valued integers (e.g., 150.0), both
+    of which must be accepted.
+
+    Args:
+        val: Value to convert.
+        default: Returned when val is None, NaN, or raises on conversion.
+
+    Returns:
+        int(float(val)) when val is a finite number, otherwise default.
+    """
+    try:
+        result = float(val)
+        return default if math.isnan(result) else int(result)
+    except (TypeError, ValueError):
+        return default
+
+
 def fetch_option_chain(
     ticker: str,
     expiration: str | None = None,
@@ -42,6 +92,8 @@ def fetch_option_chain(
 
     Returns:
         List of OptionRecord dataclass instances, one per contract.
+        Numeric fields with missing or NaN data from the API are
+        normalized to 0 rather than propagated as NaN.
 
     Raises:
         ValueError: If the ticker is invalid or no expirations are found.
@@ -59,7 +111,7 @@ def fetch_option_chain(
         if expiration not in expirations:
             raise ValueError(
                 f"Expiration '{expiration}' not available for '{ticker}'. "
-                f"Available: {list(expirations[:5])}..."
+                f"Available: {', '.join(expirations[:5])}..."
             )
         target_exp = expiration
     else:
@@ -74,14 +126,14 @@ def fetch_option_chain(
                 OptionRecord(
                     symbol=ticker.upper(),
                     expiration=date.fromisoformat(target_exp),
-                    strike=float(row.get("strike", 0)),
+                    strike=_safe_float(row.get("strike", 0)),
                     option_type=opt_type,
-                    last_price=float(row.get("lastPrice", 0)),
-                    bid=float(row.get("bid", 0)),
-                    ask=float(row.get("ask", 0)),
-                    volume=int(row.get("volume", 0) or 0),
-                    open_interest=int(row.get("openInterest", 0) or 0),
-                    implied_volatility=float(row.get("impliedVolatility", 0)),
+                    last_price=_safe_float(row.get("lastPrice", 0)),
+                    bid=_safe_float(row.get("bid", 0)),
+                    ask=_safe_float(row.get("ask", 0)),
+                    volume=_safe_int(row.get("volume", 0)),
+                    open_interest=_safe_int(row.get("openInterest", 0)),
+                    implied_volatility=_safe_float(row.get("impliedVolatility", 0)),
                 )
             )
 
