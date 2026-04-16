@@ -9,6 +9,7 @@ Covers:
   gamma/vega symmetry, theta sign, rho and epsilon signs, charm/vanna types)
 - Volatility surface construction and structural invariants
 - ComparisonReport filtering and aggregate statistics
+- NaN-safe conversion helpers in fetcher.py
 
 Design note: tests that involve Monte Carlo use a fixed seed and a generous
 absolute tolerance. The MC error bound reflects the statistical nature of the
@@ -23,7 +24,7 @@ from datetime import date, timedelta
 import pytest
 
 from optionview.compare import compare_to_market
-from optionview.fetcher import OptionRecord
+from optionview.fetcher import OptionRecord, _safe_float, _safe_int
 from optionview.greeks import compute_greeks
 from optionview.models import (
     binomial_tree,
@@ -593,7 +594,7 @@ class TestVolatilitySurface:
         surface = build_surface(records, SPOT, RATE)
         summaries = surface.smile_summary()
         assert len(summaries) == 1
-        assert summaries[0].smile_slope is None
+           assert summaries[0].smile_slope is None
 
 
 # ---------------------------------------------------------------------------
@@ -750,3 +751,168 @@ class TestCompareToMarket:
         assert total_counts == len(report.results), (
             f"best_model_counts sum {total_counts} != result count {len(report.results)}"
         )
+
+
+# ---------------------------------------------------------------------------
+# NaN-safe conversion helpers
+# ---------------------------------------------------------------------------
+
+class TestSafeFloat:
+    """Unit tests for _safe_float, the NaN-tolerant float converter in fetcher.py.
+
+    yfinance DataFrames return numpy NaN for missing bid, ask, and
+    impliedVolatility fields. _safe_float ensures these values are
+    substituted with a default (0.0 by default) rather than propagating
+    silently through downstream filters and arithmetic.
+    """
+
+    def test_nan_returns_default(self) -> None:
+        """float('nan') must be replaced by the default value."""
+        assert _safe_float(float("nan")) == 0.0
+
+    def test_nan_custom_default(self) -> None:
+        """Custom default must be returned when val is NaN."""
+        assert _safe_float(float("nan"), default=-1.0) == -1.0
+
+    def test_none_returns_default(self) -> None:
+        """None input must be replaced by the default."""
+        assert _safe_float(None) == 0.0
+
+    def test_valid_positive_float(self) -> None:
+        """A normal positive float must pass through unchanged."""
+        assert _safe_float(1.5) == 1.5
+
+    def test_valid_zero(self) -> None:
+        """Explicit zero is a valid value and must not be replaced."""
+        assert _safe_float(0.0) == 0.0
+
+    def test_negative_float(self) -> None:
+        """Negative values are valid and must pass through unchanged."""
+        assert _safe_float(-3.14) == -3.14
+
+    def test_integer_input(self) -> None:
+        """Integer inputs must be converted to float correctly."""
+        assert _safe_float(5) == 5.0
+
+    def test_string_numeric(self) -> None:
+        """Numeric strings must be converted to float."""
+        assert _safe_float("2.5") == 2.5
+
+    def test_string_nonnumeric_returns_default(self) -> None:
+        """A non-numeric string must return the default."""
+        assert _safe_float("not_a_number") == 0.0
+
+
+class TestSafeInt:
+    """Unit tests for _safe_int, the NaN-tolerant integer converter in fetcher.py.
+
+    Fields like volume and open_interest are stored as int in OptionRecord.
+    yfinance can return NaN for these fields; int(float('nan')) raises ValueError
+    in CPython, so a guard is needed before the conversion.
+    """
+
+    def test_nan_returns_default(self) -> None:
+        """float('nan') must be replaced by the integer default (0)."""
+        assert _safe_int(float("nan")) == 0
+
+    def test_none_returns_default(self) -> None:
+        """None must be replaced by the default."""
+        assert _safe_int(None) == 0
+
+    def test_valid_integer(self) -> None:
+        """A plain integer must pass through unchanged."""
+        assert _safe_int(42) == 42
+
+    def test_float_truncates(self) -> None:
+        """A float is truncated toward zero, not rounded."""
+        assert _safe_int(5.9) == 5
+
+    def test_zero(self) -> None:
+        """Zero is a valid value and must not be replaced."""
+        assert _safe_int(0) == 0
+
+    def test_string_integer(self) -> None:
+        """A string encoding an integer must be converted correctly."""
+        assert _safe_int("10") == 10
+
+    def test_custom_default(self) -> None:
+        """Custom default must be used when val is NaN."""
+        assert _safe_int(float("nan"), default=-1) == -1
+
+    def test_string_nonnumeric_returns_default(self) -> None:
+        """A non-numeric string must return the default."""
+        assert _safe_int("bad") == 0
+
+
+class TestNaNFieldsInCompare:
+    """Integration tests confirming that OptionRecords with NaN-derived zero
+    fields are handled correctly by compare_to_market and build_surface.
+
+    These tests simulate what happens after fetch_option_chain processes a
+    yfinance row that had NaN for bid and ask: those fields become 0.0, and
+    the contract should be treated as having no reliable quote and skipped.
+    """
+
+    def test_zero_bid_ask_filtered_as_zero_market(self) -> None:
+        """A record with bid=0.0 and ask=0.0 (from NaN normalization) must be
+        classified as zero_market and excluded from comparison results."""
+        exp = date.today() + timedelta(days=30)
+        rec = OptionRecord(
+            symbol="TEST",
+            expiration=exp,
+            strike=100.0,
+            option_type="call",
+            last_price=0.0,
+            bid=0.0,   # NaN was normalized to 0.0 by _safe_float
+            ask=0.0,   # NaN was normalized to 0.0 by _safe_float
+            volume=0,
+            open_interest=500,
+            implied_volatility=0.20,
+        )
+        report = compare_to_market([rec], SPOT, RATE)
+        assert len(report.results) == 0
+        assert len(report.skipped) == 1
+        assert report.skipped[0].reason == "zero_market"
+
+    def test_zero_iv_filtered_in_convergence_mode(self) -> None:
+        """A record with implied_volatility=0.0 (from NaN normalization) must be
+        classified as zero_implied_volatility and excluded."""
+        exp = date.today() + timedelta(days=30)
+        rec = OptionRecord(
+            symbol="TEST",
+            expiration=exp,
+            strike=100.0,
+            option_type="call",
+            last_price=2.0,
+            bid=1.95,
+            ask=2.05,
+            volume=100,
+            open_interest=200,
+            implied_volatility=0.0,  # NaN normalized to 0.0
+        )
+        report = compare_to_market([rec], SPOT, RATE)
+        assert len(report.results) == 0
+        assert len(report.skipped) == 1
+        assert report.skipped[0].reason == "zero_implied_volatility"
+
+    def test_zero_open_interest_filtered_when_min_set(self) -> None:
+        """A record with open_interest=0 (from NaN normalization) must be
+        excluded when min_open_interest > 0."""
+        exp = date.today() + timedelta(days=30)
+        bs_mid = black_scholes(SPOT, 100.0, RATE, 0.20, 30 / 365.0, "call")
+        rec = OptionRecord(
+            symbol="TEST",
+            expiration=exp,
+            strike=100.0,
+            option_type="call",
+            last_price=bs_mid,
+            bid=round(bs_mid * 0.99, 4),
+            ask=round(bs_mid * 1.01, 4),
+            volume=0,
+            open_interest=0,   # NaN normalized to 0
+            implied_volatility=0.20,
+        )
+        report = compare_to_market([rec], SPOT, RATE, min_open_interest=1)
+        assert len(report.results) == 0
+        assert len(report.skipped) == 1
+        assert report.skipped[0].reason == "low_open_interest"
