@@ -10,6 +10,7 @@ A Python toolkit for comparing option pricing models against real-time market da
 - **Volatility Surface Construction**: Builds an implied volatility surface from multi-expiry option chains, with per-expiry smile analysis (OLS slope and IV range), ATM term structure extraction, and log-moneyness normalized IVPoints
 - **Greeks Calculation**: Full analytical Greeks including Delta, Gamma, Theta, Vega, Rho, Epsilon (dividend sensitivity), Vanna, and Charm
 - **Implied Volatility Solver**: Newton-Raphson IV solver with configurable tolerance
+- **Portfolio Greeks Aggregation**: Aggregate Greeks across a collection of long and short option positions, with per-position and net portfolio risk
 - **Clean API**: Simple, composable functions for scripting and analysis
 
 ## Installation
@@ -163,6 +164,50 @@ The smile slope is the OLS slope of IV regressed on log-moneyness. A negative sl
 downside demand. A strongly negative slope across all expirations signals pronounced
 skew, which has implications for delta-hedging books with large gamma exposure.
 
+## Portfolio Greeks
+
+Aggregate Greeks across a collection of option positions to compute net portfolio
+risk. Each position carries a signed quantity: positive means long, negative means
+short.
+
+```python
+from optionview.portfolio import Position, aggregate_greeks
+
+# A delta-neutral straddle: long call + long put at the same strike
+positions = [
+    Position(
+        spot=150.0, strike=150.0, rate=0.05, volatility=0.25,
+        expiry_years=0.25, option_type="call", quantity=10, label="long call"
+    ),
+    Position(
+        spot=150.0, strike=150.0, rate=0.05, volatility=0.25,
+        expiry_years=0.25, option_type="put", quantity=10, label="long put"
+    ),
+]
+
+risk = aggregate_greeks(positions)
+
+print(f"Net delta:  {risk.net_greeks['delta']:+.4f}")   # near zero for ATM straddle
+print(f"Net gamma:  {risk.net_greeks['gamma']:+.4f}")   # positive (long gamma)
+print(f"Net vega:   {risk.net_greeks['vega']:+.4f}")    # positive (long vol)
+print(f"Net theta:  {risk.net_greeks['theta']:+.4f}")   # negative (time decay)
+print(f"Dollar delta: ${risk.net_dollar_delta:+.2f}")   # net $ exposure per $1 spot move
+print(f"Dollar gamma: ${risk.net_dollar_gamma:+.2f}")   # $ convexity per $1 spot move
+
+# Per-position breakdown
+for pr in risk.positions:
+    pos = pr.position
+    print(
+        f"  [{pos.label}] qty={pos.quantity:+g} "
+        f"delta={pr.scaled_greeks['delta']:+.4f} "
+        f"gamma={pr.scaled_greeks['gamma']:+.4f}"
+    )
+```
+
+Dollar delta (`unit_delta * spot * quantity`) normalizes position size across
+different strikes and expirations, making it easier to compare exposure contributions
+when all positions share the same underlying.
+
 ## Project Structure
 
 ```
@@ -173,6 +218,7 @@ optionview/
   fetcher.py       - Market data retrieval from free APIs
   surface.py       - Implied volatility surface construction and smile analysis
   compare.py       - Model-vs-market comparison utilities
+  portfolio.py     - Portfolio-level Greeks aggregation
 ```
 
 ## Pricing Models
@@ -191,7 +237,6 @@ Path-based simulation with antithetic variates for variance reduction. Best suit
 - HTML dashboard for interactive comparison
 - Volatility surface visualization (surface construction is implemented; charting is not)
 - Additional models (Heston, SABR)
-- Portfolio-level Greeks aggregation
 - Historical backtesting of model accuracy
 
 ## License
