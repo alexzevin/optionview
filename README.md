@@ -7,6 +7,7 @@ A Python toolkit for comparing option pricing models against real-time market da
 - **Multiple Pricing Models**: Black-Scholes, Binomial Tree, and Monte Carlo simulation
 - **Live Market Data**: Fetches real-time option chains from Yahoo Finance (no API key required)
 - **Model Comparison**: Side-by-side comparison of theoretical vs. market prices
+- **Volatility Surface Construction**: Builds an implied volatility surface from multi-expiry option chains, with per-expiry smile analysis (OLS slope and IV range), ATM term structure extraction, and log-moneyness normalized IVPoints
 - **Greeks Calculation**: Full analytical Greeks including Delta, Gamma, Theta, Vega, Rho, Epsilon (dividend sensitivity), Vanna, and Charm
 - **Implied Volatility Solver**: Newton-Raphson IV solver with configurable tolerance
 - **Clean API**: Simple, composable functions for scripting and analysis
