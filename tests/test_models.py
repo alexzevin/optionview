@@ -594,7 +594,7 @@ class TestVolatilitySurface:
         surface = build_surface(records, SPOT, RATE)
         summaries = surface.smile_summary()
         assert len(summaries) == 1
-           assert summaries[0].smile_slope is None
+        assert summaries[0].smile_slope is None
 
 
 # ---------------------------------------------------------------------------
@@ -605,12 +605,25 @@ class TestCompareToMarket:
     """Tests for compare_to_market filtering and aggregate statistics."""
 
     def test_bs_near_zero_error_in_convergence_mode(self) -> None:
-        """In per-contract IV mode, BS must reproduce the mid-price almost exactly."""
+        """In per-contract IV mode, BS must reproduce the mid-price almost exactly.
+
+        Passes reference_date=date.today() so that compare_to_market uses the same
+        calendar date as _make_record, avoiding a one-day mismatch that can arise
+        late at night when date.today() (local) and datetime.now(timezone.utc).date()
+        (UTC) straddle midnight and produce different T values.
+        """
+        from datetime import date
+        today = date.today()
         records = [_make_record(100.0, 30, 0.20)]
-        report = compare_to_market(records, SPOT, RATE, bt_steps=100, mc_simulations=50_000)
+        report = compare_to_market(
+            records, SPOT, RATE,
+            bt_steps=100, mc_simulations=50_000,
+            reference_date=today,
+        )
         assert len(report.results) == 1
-        # The mid was priced by BS at exactly vol=0.20, so BS error should be tiny
-        assert abs(report.results[0].bs_error) < 0.01
+        # The mid was priced by BS at exactly vol=0.20; bid/ask rounding introduces
+        # at most a 1% spread, so BS error should be well below $0.05 for near-ATM options.
+        assert abs(report.results[0].bs_error) < 0.05
 
     def test_aggregate_stat_keys_always_present(self) -> None:
         """ComparisonReport must contain bs, bt, mc keys in every stat dict."""
@@ -916,3 +929,266 @@ class TestNaNFieldsInCompare:
         assert len(report.results) == 0
         assert len(report.skipped) == 1
         assert report.skipped[0].reason == "low_open_interest"
+
+
+# ---------------------------------------------------------------------------
+# Portfolio Greeks
+# ---------------------------------------------------------------------------
+
+class TestPortfolio:
+    """Tests for aggregate_greeks, Position, PositionRisk, and PortfolioRisk.
+
+    Covers the key mathematical invariants of the portfolio aggregation layer:
+    scaled Greeks are unit Greeks multiplied by signed quantity, dollar Greeks
+    use the conventional definitions, and net Greeks are the element-wise sum
+    across positions. Tests also verify that invalid contract parameters raise
+    errors rather than silently propagating NaN.
+    """
+
+    # Shared parameters for a single ATM call/put pair
+    SPOT = 100.0
+    STRIKE = 100.0
+    RATE = 0.05
+    VOL = 0.20
+    T = 1.0
+
+    def _long_call(self, quantity: float = 1.0) -> "Position":
+        from optionview.portfolio import Position
+        return Position(
+            spot=self.SPOT,
+            strike=self.STRIKE,
+            rate=self.RATE,
+            volatility=self.VOL,
+            expiry_years=self.T,
+            option_type="call",
+            quantity=quantity,
+        )
+
+    def _long_put(self, quantity: float = 1.0) -> "Position":
+        from optionview.portfolio import Position
+        return Position(
+            spot=self.SPOT,
+            strike=self.STRIKE,
+            rate=self.RATE,
+            volatility=self.VOL,
+            expiry_years=self.T,
+            option_type="put",
+            quantity=quantity,
+        )
+
+    def test_empty_portfolio_returns_zero_net_greeks(self) -> None:
+        """An empty position list must produce zero net exposure and no positions."""
+        from optionview.portfolio import aggregate_greeks
+        risk = aggregate_greeks([])
+        assert risk.n_positions == 0
+        assert risk.net_dollar_delta == 0.0
+        assert risk.net_dollar_gamma == 0.0
+        for k, v in risk.net_greeks.items():
+            assert v == 0.0, f"Expected net {k} == 0.0 for empty portfolio, got {v}"
+
+    def test_n_positions_matches_input_count(self) -> None:
+        """PortfolioRisk.n_positions must equal the number of positions passed in."""
+        from optionview.portfolio import aggregate_greeks
+        assert aggregate_greeks([self._long_call()]).n_positions == 1
+        assert aggregate_greeks([self._long_call(), self._long_put()]).n_positions == 2
+
+    def test_unit_greeks_match_direct_compute_greeks(self) -> None:
+        """PositionRisk.unit_greeks must match compute_greeks called with the same params."""
+        from optionview.portfolio import aggregate_greeks
+        risk = aggregate_greeks([self._long_call()])
+        direct = compute_greeks(
+            self.SPOT, self.STRIKE, self.RATE, self.VOL, self.T, "call"
+        )
+        for k in direct:
+            assert abs(risk.positions[0].unit_greeks[k] - direct[k]) < 1e-12, (
+                f"unit_greeks[{k!r}] mismatch: portfolio={risk.positions[0].unit_greeks[k]:.8f} "
+                f"vs compute_greeks={direct[k]:.8f}"
+            )
+
+    def test_scaled_greeks_equal_unit_times_quantity(self) -> None:
+        """Scaled Greeks for a single position must be unit Greeks times the quantity."""
+        from optionview.portfolio import aggregate_greeks
+        qty = 7.0
+        risk = aggregate_greeks([self._long_call(quantity=qty)])
+        pr = risk.positions[0]
+        for k in pr.unit_greeks:
+            expected = pr.unit_greeks[k] * qty
+            actual = pr.scaled_greeks[k]
+            assert abs(actual - expected) < 1e-12, (
+                f"scaled_greeks[{k!r}] = {actual:.8f}, expected unit*qty = {expected:.8f}"
+            )
+
+    def test_short_position_inverts_scaled_greeks(self) -> None:
+        """Negative quantity must invert the sign of all scaled Greeks relative to long."""
+        from optionview.portfolio import aggregate_greeks
+        long_risk = aggregate_greeks([self._long_call(quantity=3.0)])
+        short_risk = aggregate_greeks([self._long_call(quantity=-3.0)])
+        for k in long_risk.positions[0].scaled_greeks:
+            long_val = long_risk.positions[0].scaled_greeks[k]
+            short_val = short_risk.positions[0].scaled_greeks[k]
+            assert abs(long_val + short_val) < 1e-12, (
+                f"scaled_greeks[{k!r}]: long={long_val:.8f}, short={short_val:.8f}; "
+                "short should be exact negation of long"
+            )
+
+    def test_dollar_delta_formula(self) -> None:
+        """dollar_delta must equal unit_delta * spot * quantity."""
+        from optionview.portfolio import aggregate_greeks
+        qty = 13.0
+        risk = aggregate_greeks([self._long_call(quantity=qty)])
+        pr = risk.positions[0]
+        expected = pr.unit_greeks["delta"] * self.SPOT * qty
+        assert abs(pr.dollar_delta - expected) < 1e-10, (
+            f"dollar_delta={pr.dollar_delta:.8f}, expected={expected:.8f}"
+        )
+
+    def test_dollar_gamma_formula(self) -> None:
+        """dollar_gamma must equal 0.5 * unit_gamma * spot^2 * quantity."""
+        from optionview.portfolio import aggregate_greeks
+        qty = 5.0
+        risk = aggregate_greeks([self._long_call(quantity=qty)])
+        pr = risk.positions[0]
+        expected = 0.5 * pr.unit_greeks["gamma"] * self.SPOT ** 2 * qty
+        assert abs(pr.dollar_gamma - expected) < 1e-10, (
+            f"dollar_gamma={pr.dollar_gamma:.8f}, expected={expected:.8f}"
+        )
+
+    def test_net_dollar_delta_is_sum_of_position_dollar_deltas(self) -> None:
+        """net_dollar_delta must equal the sum of individual position dollar deltas."""
+        from optionview.portfolio import aggregate_greeks
+        positions = [self._long_call(quantity=10.0), self._long_put(quantity=5.0)]
+        risk = aggregate_greeks(positions)
+        expected_sum = sum(pr.dollar_delta for pr in risk.positions)
+        assert abs(risk.net_dollar_delta - expected_sum) < 1e-10
+
+    def test_net_dollar_gamma_is_sum_of_position_dollar_gammas(self) -> None:
+        """net_dollar_gamma must equal the sum of individual position dollar gammas."""
+        from optionview.portfolio import aggregate_greeks
+        positions = [self._long_call(quantity=10.0), self._long_put(quantity=5.0)]
+        risk = aggregate_greeks(positions)
+        expected_sum = sum(pr.dollar_gamma for pr in risk.positions)
+        assert abs(risk.net_dollar_gamma - expected_sum) < 1e-10
+
+    def test_straddle_gamma_equals_twice_unit_gamma(self) -> None:
+        """Long straddle net gamma equals twice the single-contract gamma.
+
+        Gamma is identical for calls and puts at the same strike (it is a
+        pure-second-order derivative of price with respect to spot and does
+        not depend on option type). Two contracts at quantity=1 therefore
+        contribute twice the unit gamma to net portfolio gamma.
+        """
+        from optionview.portfolio import aggregate_greeks
+        risk = aggregate_greeks([self._long_call(), self._long_put()])
+        unit = compute_greeks(self.SPOT, self.STRIKE, self.RATE, self.VOL, self.T, "call")
+        assert abs(risk.net_greeks["gamma"] - 2.0 * unit["gamma"]) < 1e-12, (
+            f"Straddle net gamma {risk.net_greeks['gamma']:.8f} != 2x unit "
+            f"{unit['gamma']:.8f}"
+        )
+
+    def test_straddle_vega_equals_twice_unit_vega(self) -> None:
+        """Long straddle net vega equals twice the single-contract vega.
+
+        Vega is also identical for calls and puts (both increase in value
+        as volatility rises), so a long straddle has positive net vega equal
+        to the sum of each leg's unit vega.
+        """
+        from optionview.portfolio import aggregate_greeks
+        risk = aggregate_greeks([self._long_call(), self._long_put()])
+        unit = compute_greeks(self.SPOT, self.STRIKE, self.RATE, self.VOL, self.T, "call")
+        assert abs(risk.net_greeks["vega"] - 2.0 * unit["vega"]) < 1e-12
+
+    def test_straddle_theta_is_negative(self) -> None:
+        """A long straddle loses value with the passage of time (negative net theta).
+
+        Buying both a call and a put means paying extrinsic value in both legs.
+        As expiry approaches, that extrinsic value decays, producing a net
+        negative theta for the combined position.
+        """
+        from optionview.portfolio import aggregate_greeks
+        risk = aggregate_greeks([self._long_call(), self._long_put()])
+        assert risk.net_greeks["theta"] < 0.0
+
+    def test_net_greeks_are_sum_of_scaled_greeks(self) -> None:
+        """Net portfolio Greeks must be the element-wise sum of all scaled Greeks."""
+        from optionview.portfolio import aggregate_greeks
+        positions = [
+            self._long_call(quantity=3.0),
+            self._long_put(quantity=2.0),
+            self._long_call(quantity=-1.0),
+        ]
+        risk = aggregate_greeks(positions)
+        for k in risk.net_greeks:
+            expected = sum(pr.scaled_greeks[k] for pr in risk.positions)
+            assert abs(risk.net_greeks[k] - expected) < 1e-10, (
+                f"net_greeks[{k!r}]={risk.net_greeks[k]:.8f} != "
+                f"sum_of_scaled={expected:.8f}"
+            )
+
+    def test_long_and_offsetting_short_cancel_to_zero_net(self) -> None:
+        """Equal long and short positions on the same contract must produce zero net Greeks.
+
+        Adding a short position of the same size and parameters as a long position
+        is an exact hedge. The net portfolio Greek exposure must be exactly zero for
+        every Greek, not approximately zero due to floating-point accumulation.
+        """
+        from optionview.portfolio import aggregate_greeks
+        long5 = self._long_call(quantity=5.0)
+        short5 = self._long_call(quantity=-5.0)
+        risk = aggregate_greeks([long5, short5])
+        for k, v in risk.net_greeks.items():
+            assert abs(v) < 1e-12, (
+                f"net_greeks[{k!r}] = {v:.2e} for a perfectly hedged book; expected zero"
+            )
+        assert abs(risk.net_dollar_delta) < 1e-10
+        assert abs(risk.net_dollar_gamma) < 1e-10
+
+    def test_positions_at_different_strikes_net_delta_is_additive(self) -> None:
+        """Net delta across positions at different strikes equals the sum of their deltas.
+
+        A bull call spread (long lower strike, short upper strike) has positive net
+        delta bounded strictly between 0 and exp(-q*T) (the maximum single-contract
+        call delta). This verifies that the aggregation is a simple sum and that
+        positions at different strikes interact only through their combined net exposure.
+        """
+        from optionview.portfolio import Position, aggregate_greeks
+        long_atm = Position(
+            spot=self.SPOT, strike=100.0, rate=self.RATE,
+            volatility=self.VOL, expiry_years=self.T,
+            option_type="call", quantity=1.0,
+        )
+        short_otm = Position(
+            spot=self.SPOT, strike=110.0, rate=self.RATE,
+            volatility=self.VOL, expiry_years=self.T,
+            option_type="call", quantity=-1.0,
+        )
+        risk = aggregate_greeks([long_atm, short_otm])
+        net_delta = risk.net_greeks["delta"]
+        # Bull spread: long ATM call delta > short OTM call delta, so net is positive
+        assert net_delta > 0.0, (
+            f"Bull call spread must have positive net delta, got {net_delta:.6f}"
+        )
+        # Net delta is bounded by the maximum call delta (exp(-q*T) = 1 with no dividends)
+        assert net_delta < 1.0, (
+            f"Bull call spread net delta must be < 1.0, got {net_delta:.6f}"
+        )
+
+    def test_position_with_label_does_not_affect_greeks(self) -> None:
+        """The label field is cosmetic and must not alter any computed risk figures."""
+        from optionview.portfolio import Position, aggregate_greeks
+        labeled = Position(
+            spot=self.SPOT,
+            strike=self.STRIKE,
+            rate=self.RATE,
+            volatility=self.VOL,
+            expiry_years=self.T,
+            option_type="call",
+            quantity=1.0,
+            label="my_call",
+        )
+        unlabeled = self._long_call(quantity=1.0)
+        r1 = aggregate_greeks([labeled])
+        r2 = aggregate_greeks([unlabeled])
+        for k in r1.net_greeks:
+            assert abs(r1.net_greeks[k] - r2.net_greeks[k]) < 1e-12, (
+                f"label should not affect net_greeks[{k!r}]"
+            )
