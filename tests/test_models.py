@@ -1406,3 +1406,152 @@ class TestGreeksFiniteDifference:
         assert abs(self._greeks()["charm"] - fd) < self.FD_TOL_CROSS, (
             f"Charm: analytical={self._greeks()['charm']:.8f}, fd={fd:.8f}"
         )
+
+
+# ---------------------------------------------------------------------------
+# VolatilitySurface.interpolate_iv
+# ---------------------------------------------------------------------------
+
+class TestInterpolateIV:
+    """Tests for VolatilitySurface.interpolate_iv.
+
+    interpolate_iv uses piecewise-linear interpolation along the smile for a
+    given expiration, with flat extrapolation beyond the observed strike range.
+    Tests cover the interior case, exact hits on grid points, boundary
+    extrapolation on both sides, and error conditions.
+    """
+
+    # Shared 30-day expiry with a three-point smile: low/ATM/high strikes
+    EXP_DAYS = 30
+    LOW_K = 90.0
+    ATM_K = 100.0
+    HIGH_K = 110.0
+    LOW_IV = 0.25
+    ATM_IV = 0.20
+    HIGH_IV = 0.18
+
+    def _three_point_surface(self) -> "VolatilitySurface":
+        """Build a surface with three smile points at a single expiry."""
+        records = [
+            _make_record(self.LOW_K,  self.EXP_DAYS, self.LOW_IV),
+            _make_record(self.ATM_K,  self.EXP_DAYS, self.ATM_IV),
+            _make_record(self.HIGH_K, self.EXP_DAYS, self.HIGH_IV),
+        ]
+        return build_surface(records, SPOT, RATE)
+
+    def test_interior_linear_interpolation(self) -> None:
+        """Querying midway between two grid points returns their midpoint IV.
+
+        For a smile with ATM IV=0.20 and HIGH IV=0.18, the midpoint in
+        log-moneyness space must have IV exactly halfway between the two: 0.19.
+        """
+        surface = self._three_point_surface()
+        exp = surface.expirations[0]
+
+        atm_k = min(surface.smile(exp), key=lambda p: abs(p.log_moneyness))
+        high_k = max(surface.smile(exp), key=lambda p: p.log_moneyness)
+
+        mid_lm = (atm_k.log_moneyness + high_k.log_moneyness) / 2.0
+        iv = surface.interpolate_iv(exp, mid_lm)
+
+        expected = (atm_k.iv + high_k.iv) / 2.0
+        assert abs(iv - expected) < 1e-10, (
+            f"Midpoint interpolation: got {iv:.6f}, expected {expected:.6f}"
+        )
+
+    def test_exact_grid_point_returns_observed_iv(self) -> None:
+        """Querying at an observed grid log-moneyness must return that point's IV exactly."""
+        surface = self._three_point_surface()
+        exp = surface.expirations[0]
+
+        for pt in surface.smile(exp):
+            iv = surface.interpolate_iv(exp, pt.log_moneyness)
+            assert abs(iv - pt.iv) < 1e-10, (
+                f"Grid hit at log_moneyness={pt.log_moneyness:.4f}: "
+                f"got {iv:.6f}, expected {pt.iv:.6f}"
+            )
+
+    def test_left_extrapolation_returns_leftmost_iv(self) -> None:
+        """Querying below the leftmost strike must return that strike's IV (flat extrapolation)."""
+        surface = self._three_point_surface()
+        exp = surface.expirations[0]
+        leftmost = surface.smile(exp)[0]
+
+        iv = surface.interpolate_iv(exp, leftmost.log_moneyness - 0.5)
+        assert iv == leftmost.iv, (
+            f"Left extrapolation: got {iv:.6f}, expected leftmost IV {leftmost.iv:.6f}"
+        )
+
+    def test_right_extrapolation_returns_rightmost_iv(self) -> None:
+        """Querying above the rightmost strike must return that strike's IV (flat extrapolation)."""
+        surface = self._three_point_surface()
+        exp = surface.expirations[0]
+        rightmost = surface.smile(exp)[-1]
+
+        iv = surface.interpolate_iv(exp, rightmost.log_moneyness + 0.5)
+        assert iv == rightmost.iv, (
+            f"Right extrapolation: got {iv:.6f}, expected rightmost IV {rightmost.iv:.6f}"
+        )
+
+    def test_interpolated_iv_within_observed_range(self) -> None:
+        """Any interior query must return an IV between the two bracketing grid IVs.
+
+        For a monotone-decreasing smile (higher IV at lower strikes), any
+        interpolated value must be bounded by its two neighbors. This verifies
+        that piecewise-linear interpolation cannot overshoot or undershoot
+        the local IV range.
+        """
+        surface = self._three_point_surface()
+        exp = surface.expirations[0]
+        pts = surface.smile(exp)
+
+        # Query at 20 points evenly spaced across the full smile range
+        lm_min = pts[0].log_moneyness
+        lm_max = pts[-1].log_moneyness
+        for i in range(1, 20):
+            lm = lm_min + i * (lm_max - lm_min) / 20.0
+            iv = surface.interpolate_iv(exp, lm)
+            iv_min = min(p.iv for p in pts)
+            iv_max = max(p.iv for p in pts)
+            assert iv_min <= iv <= iv_max, (
+                f"Interpolated IV {iv:.6f} at log_moneyness={lm:.4f} is outside "
+                f"observed range [{iv_min:.6f}, {iv_max:.6f}]"
+            )
+
+    def test_missing_expiration_raises(self) -> None:
+        """Querying an expiration not on the surface must raise ValueError."""
+        surface = self._three_point_surface()
+        absent_date = date.today() + timedelta(days=999)
+        with pytest.raises(ValueError, match="No surface points"):
+            surface.interpolate_iv(absent_date, 0.0)
+
+    def test_single_point_expiration_raises(self) -> None:
+        """An expiration with only one IVPoint must raise ValueError (cannot interpolate)."""
+        records = [_make_record(100.0, 45, 0.20)]
+        surface = build_surface(records, SPOT, RATE)
+        exp = surface.expirations[0]
+        with pytest.raises(ValueError, match="at least two"):
+            surface.interpolate_iv(exp, 0.0)
+
+    def test_interpolation_independent_of_option_type_ordering(self) -> None:
+        """Mixing calls and puts at the same strikes must not break interpolation.
+
+        build_surface accepts both option types; the smile() method returns all
+        points sorted by log-moneyness regardless of type. interpolate_iv must
+        handle this mixed-type ordering correctly.
+        """
+        records = [
+            _make_record(90.0,  30, 0.25, option_type="put"),
+            _make_record(100.0, 30, 0.20),
+            _make_record(110.0, 30, 0.18),
+        ]
+        surface = build_surface(records, SPOT, RATE)
+        exp = surface.expirations[0]
+        pts = surface.smile(exp)
+        assert len(pts) == 3
+
+        # Midpoint between first two points should interpolate cleanly
+        mid_lm = (pts[0].log_moneyness + pts[1].log_moneyness) / 2.0
+        iv = surface.interpolate_iv(exp, mid_lm)
+        expected = (pts[0].iv + pts[1].iv) / 2.0
+        assert abs(iv - expected) < 1e-10
