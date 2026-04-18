@@ -1192,3 +1192,217 @@ class TestPortfolio:
             assert abs(r1.net_greeks[k] - r2.net_greeks[k]) < 1e-12, (
                 f"label should not affect net_greeks[{k!r}]"
             )
+
+
+# ---------------------------------------------------------------------------
+# Greeks numerical verification via finite differences
+# ---------------------------------------------------------------------------
+
+class TestGreeksFiniteDifference:
+    """Verify all eight Black-Scholes Greeks against centered finite-difference approximations.
+
+    Finite-difference checks catch formula bugs that sign-and-bound tests miss.
+    Each Greek is estimated by perturbing a single input and observing the change
+    in option price (or in delta, for cross-sensitivities). Centered differences
+    have O(h^2) truncation error; step sizes balance truncation against
+    floating-point cancellation.
+
+    All tests use a non-zero dividend yield (Q=0.02) to exercise the full
+    Merton continuous-dividend extension in every formula path.
+    """
+
+    S = 100.0   # spot
+    K = 100.0   # strike (ATM)
+    R = 0.05    # risk-free rate
+    V = 0.20    # volatility
+    T = 0.50    # 6 months (avoids near-expiry singularities)
+    Q = 0.02    # continuous dividend yield
+
+    FD_TOL = 5e-5      # first-order Greeks (delta, vega, rho, epsilon)
+    FD_TOL_2ND = 2e-4  # second-order (gamma)
+    FD_TOL_CROSS = 1e-3  # cross-partials (vanna, charm)
+
+    def _bs(
+        self,
+        s: float | None = None,
+        k: float | None = None,
+        r: float | None = None,
+        v: float | None = None,
+        t: float | None = None,
+        q: float | None = None,
+        opt: str = "call",
+    ) -> float:
+        """Black-Scholes price with optional per-parameter overrides."""
+        return black_scholes(
+            self.S if s is None else s,
+            self.K if k is None else k,
+            self.R if r is None else r,
+            self.V if v is None else v,
+            self.T if t is None else t,
+            opt,  # type: ignore[arg-type]
+            self.Q if q is None else q,
+        )
+
+    def _greeks(self, opt: str = "call") -> dict[str, float]:
+        return compute_greeks(self.S, self.K, self.R, self.V, self.T, opt, self.Q)  # type: ignore[arg-type]
+
+    # -- Delta: dV/dS --
+
+    def test_delta_call_matches_fd(self) -> None:
+        """Call delta matches (V(S+h) - V(S-h)) / (2h) within 5e-5."""
+        h = 0.5
+        fd = (self._bs(s=self.S + h) - self._bs(s=self.S - h)) / (2.0 * h)
+        assert abs(self._greeks()["delta"] - fd) < self.FD_TOL, (
+            f"Call delta: analytical={self._greeks()['delta']:.7f}, fd={fd:.7f}"
+        )
+
+    def test_delta_put_matches_fd(self) -> None:
+        """Put delta matches (V_put(S+h) - V_put(S-h)) / (2h) within 5e-5."""
+        h = 0.5
+        fd = (self._bs(s=self.S + h, opt="put") - self._bs(s=self.S - h, opt="put")) / (2.0 * h)
+        assert abs(self._greeks("put")["delta"] - fd) < self.FD_TOL, (
+            f"Put delta: analytical={self._greeks('put')['delta']:.7f}, fd={fd:.7f}"
+        )
+
+    # -- Gamma: d^2V/dS^2 --
+
+    def test_gamma_matches_fd(self) -> None:
+        """Gamma matches (V(S+h) - 2V(S) + V(S-h)) / h^2 within 2e-4."""
+        h = 0.5
+        fd = (self._bs(s=self.S + h) - 2.0 * self._bs() + self._bs(s=self.S - h)) / (h ** 2)
+        assert abs(self._greeks()["gamma"] - fd) < self.FD_TOL_2ND, (
+            f"Gamma: analytical={self._greeks()['gamma']:.7f}, fd={fd:.7f}"
+        )
+
+    def test_gamma_fd_identical_for_call_and_put(self) -> None:
+        """Finite-difference gamma is equal for call and put at the same strike.
+
+        Gamma is the second derivative of price with respect to spot and does not
+        depend on option type. Both legs of a put-call pair at the same strike must
+        share the same gamma, which the FD estimate confirms independently of the
+        analytical formula.
+        """
+        h = 0.5
+        fd_call = (self._bs(s=self.S + h) - 2.0 * self._bs() + self._bs(s=self.S - h)) / h**2
+        fd_put = (
+            self._bs(s=self.S + h, opt="put")
+            - 2.0 * self._bs(opt="put")
+            + self._bs(s=self.S - h, opt="put")
+        ) / h**2
+        assert abs(fd_call - fd_put) < 1e-10
+
+    # -- Vega: dV/dSigma (scaled to per 1% absolute vol move) --
+
+    def test_vega_call_matches_fd(self) -> None:
+        """Vega (per 1%) matches (V(sigma+h) - V(sigma-h)) / (2h) * 0.01 within 5e-5."""
+        h = 0.005
+        fd = (self._bs(v=self.V + h) - self._bs(v=self.V - h)) / (2.0 * h) * 0.01
+        assert abs(self._greeks()["vega"] - fd) < self.FD_TOL, (
+            f"Vega: analytical={self._greeks()['vega']:.7f}, fd={fd:.7f}"
+        )
+
+    # -- Theta: -dV/dT per calendar day --
+
+    def test_theta_call_matches_fd(self) -> None:
+        """Call theta matches -(V(T+h) - V(T-h)) / (2h) / 365 within 5e-5.
+
+        Theta is conventionally expressed as the dollar decay per calendar day
+        as expiry approaches, hence the negative sign and 1/365 scaling. For a
+        long call this value is negative (time erodes option value).
+        """
+        h = 0.01
+        fd = -(self._bs(t=self.T + h) - self._bs(t=self.T - h)) / (2.0 * h) / 365.0
+        assert abs(self._greeks()["theta"] - fd) < self.FD_TOL, (
+            f"Call theta: analytical={self._greeks()['theta']:.8f}, fd={fd:.8f}"
+        )
+
+    def test_theta_put_matches_fd(self) -> None:
+        """Put theta matches finite-difference estimate within 5e-5."""
+        h = 0.01
+        fd = -(
+            self._bs(t=self.T + h, opt="put") - self._bs(t=self.T - h, opt="put")
+        ) / (2.0 * h) / 365.0
+        assert abs(self._greeks("put")["theta"] - fd) < self.FD_TOL, (
+            f"Put theta: analytical={self._greeks('put')['theta']:.8f}, fd={fd:.8f}"
+        )
+
+    # -- Rho: dV/dr per 1% rate move --
+
+    def test_rho_call_matches_fd(self) -> None:
+        """Call rho (per 1% rate) matches (V(r+h) - V(r-h)) / (2h) * 0.01 within 5e-5."""
+        h = 0.001
+        fd = (self._bs(r=self.R + h) - self._bs(r=self.R - h)) / (2.0 * h) * 0.01
+        assert abs(self._greeks()["rho"] - fd) < self.FD_TOL, (
+            f"Call rho: analytical={self._greeks()['rho']:.7f}, fd={fd:.7f}"
+        )
+
+    def test_rho_put_matches_fd(self) -> None:
+        """Put rho matches finite-difference estimate within 5e-5."""
+        h = 0.001
+        fd = (
+            self._bs(r=self.R + h, opt="put") - self._bs(r=self.R - h, opt="put")
+        ) / (2.0 * h) * 0.01
+        assert abs(self._greeks("put")["rho"] - fd) < self.FD_TOL, (
+            f"Put rho: analytical={self._greeks('put')['rho']:.7f}, fd={fd:.7f}"
+        )
+
+    # -- Epsilon: dV/dq per 1% dividend yield move --
+
+    def test_epsilon_call_matches_fd(self) -> None:
+        """Call epsilon (per 1% yield) matches (V(q+h) - V(q-h)) / (2h) * 0.01 within 5e-5."""
+        h = 0.001
+        fd = (self._bs(q=self.Q + h) - self._bs(q=self.Q - h)) / (2.0 * h) * 0.01
+        assert abs(self._greeks()["epsilon"] - fd) < self.FD_TOL, (
+            f"Call epsilon: analytical={self._greeks()['epsilon']:.7f}, fd={fd:.7f}"
+        )
+
+    def test_epsilon_put_matches_fd(self) -> None:
+        """Put epsilon matches finite-difference estimate within 5e-5."""
+        h = 0.001
+        fd = (
+            self._bs(q=self.Q + h, opt="put") - self._bs(q=self.Q - h, opt="put")
+        ) / (2.0 * h) * 0.01
+        assert abs(self._greeks("put")["epsilon"] - fd) < self.FD_TOL, (
+            f"Put epsilon: analytical={self._greeks('put')['epsilon']:.7f}, fd={fd:.7f}"
+        )
+
+    # -- Vanna: d(delta)/d(sigma) --
+
+    def test_vanna_call_matches_fd(self) -> None:
+        """Vanna matches d(delta)/d(sigma) estimated via centered differences.
+
+        Vanna is the mixed partial d^2V/(dS d_sigma). Differencing the analytical
+        delta with respect to vol avoids accumulating two layers of finite-difference
+        error and isolates the formula under test. Tolerance is 1e-3 because vanna
+        itself is small in magnitude (~0.07 for these parameters).
+        """
+        h = 0.005
+
+        def _delta_at_vol(vol: float) -> float:
+            return compute_greeks(self.S, self.K, self.R, vol, self.T, "call", self.Q)["delta"]  # type: ignore[arg-type]
+
+        fd = (_delta_at_vol(self.V + h) - _delta_at_vol(self.V - h)) / (2.0 * h)
+        assert abs(self._greeks()["vanna"] - fd) < self.FD_TOL_CROSS, (
+            f"Vanna: analytical={self._greeks()['vanna']:.6f}, fd={fd:.6f}"
+        )
+
+    # -- Charm: -d(delta)/dT per calendar day --
+
+    def test_charm_call_matches_fd(self) -> None:
+        """Charm matches -d(delta)/dT / 365 estimated via centered differences.
+
+        Charm is the daily rate of change of delta as time passes. Differencing
+        the analytical delta with respect to T, then negating (time to expiry
+        decreases as calendar time advances), and scaling by 1/365 gives the
+        per-day delta decay. For a near-ATM call, charm is negative: delta drifts
+        toward 0.5*exp(-q*T) as expiry approaches.
+        """
+        h = 0.01  # ~3.65 calendar days
+
+        def _delta_at_T(t: float) -> float:
+            return compute_greeks(self.S, self.K, self.R, self.V, t, "call", self.Q)["delta"]  # type: ignore[arg-type]
+
+        fd = -(_delta_at_T(self.T + h) - _delta_at_T(self.T - h)) / (2.0 * h) / 365.0
+        assert abs(self._greeks()["charm"] - fd) < self.FD_TOL_CROSS, (
+            f"Charm: analytical={self._greeks()['charm']:.8f}, fd={fd:.8f}"
+        )
