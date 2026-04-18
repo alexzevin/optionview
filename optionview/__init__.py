@@ -1,6 +1,6 @@
 """optionview - Compare option pricing models against live market data."""
 
-__version__ = "0.1.4"
+__version__ = "0.1.5"
 
 from optionview.models import black_scholes, binomial_tree, monte_carlo, implied_volatility
 from optionview.greeks import compute_greeks
