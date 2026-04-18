@@ -168,6 +168,77 @@ class VolatilitySurface:
             result[exp] = atm_pt.iv
         return result
 
+    def interpolate_iv(self, expiration: date, log_moneyness: float) -> float:
+        """Interpolate implied volatility at an arbitrary log-moneyness for a given expiry.
+
+        Uses piecewise-linear interpolation across smile points sorted by log-moneyness.
+        When the query falls outside the observed strike range, the IV of the nearest
+        boundary point is returned (flat extrapolation). Flat extrapolation is the most
+        conservative choice: it avoids introducing artificial slope at the tails that
+        would understate the true cost of far-OTM options, and it makes no distributional
+        assumptions beyond what the observed market quotes support.
+
+        Piecewise-linear interpolation is preferred over parametric forms (SVI, SSVI)
+        when the smile is used for pricing rather than calibration: it reproduces
+        observed market IVs exactly at grid points, introduces no free parameters, and
+        cannot create local extrema between data points that would generate static
+        arbitrage.
+
+        Args:
+            expiration: The expiry slice to interpolate. Must be present in
+                self.expirations.
+            log_moneyness: Target log(K / F) value. Negative means the strike is
+                below the risk-neutral forward (ITM call / OTM put); zero is
+                ATM-forward; positive means the strike is above the forward.
+
+        Returns:
+            Interpolated implied volatility as a decimal (e.g. 0.22 for 22%).
+
+        Raises:
+            ValueError: If no surface points exist for the given expiration.
+            ValueError: If fewer than two points are available for the expiration,
+                which makes interpolation undefined (a single quote has no spread
+                to interpolate across).
+        """
+        pts = self.smile(expiration)
+        if not pts:
+            raise ValueError(
+                f"No surface points for expiration {expiration}. "
+                f"Available expirations: {self.expirations}"
+            )
+        if len(pts) < 2:
+            raise ValueError(
+                f"Interpolation requires at least two smile points for expiration "
+                f"{expiration}; only {len(pts)} available. Use atm_term_structure() "
+                f"to read the single observed IV directly."
+            )
+
+        # Flat extrapolation beyond the observed strike range
+        if log_moneyness <= pts[0].log_moneyness:
+            return pts[0].iv
+        if log_moneyness >= pts[-1].log_moneyness:
+            return pts[-1].iv
+
+        # Binary search for the bracketing interval [pts[lo], pts[hi]]
+        lo, hi = 0, len(pts) - 1
+        while hi - lo > 1:
+            mid = (lo + hi) // 2
+            if pts[mid].log_moneyness <= log_moneyness:
+                lo = mid
+            else:
+                hi = mid
+
+        left, right = pts[lo], pts[hi]
+        span = right.log_moneyness - left.log_moneyness
+
+        # Guard against degenerate case: two distinct IVPoints at the same log-moneyness
+        # (e.g. a call and put at the identical strike). Return the mean of their IVs.
+        if span < 1e-12:
+            return (left.iv + right.iv) * 0.5
+
+        t = (log_moneyness - left.log_moneyness) / span
+        return left.iv + t * (right.iv - left.iv)
+
     def smile_summary(self) -> list[SmileSummary]:
         """Summary statistics for each expiry's volatility smile.
 
