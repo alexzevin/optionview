@@ -1,4 +1,4 @@
-"""Portfolio-level Greeks aggregation for collections of option positions.
+"""Portfolio-level Greeks aggregation and scenario P&L analysis.
 
 Aggregates analytical Greeks across a set of option positions, accounting
 for position size and direction (long or short). Each position is described
@@ -18,9 +18,17 @@ Dollar Greeks are provided alongside unit Greeks:
     contribution for a $1 absolute move in spot. A large positive dollar
     gamma means the portfolio benefits disproportionately from large moves.
 
+Scenario P&L:
+  scenario_pnl applies a second-order Taylor expansion to estimate portfolio
+  P&L for a hypothetical simultaneous move in spot, implied volatility, and
+  time. The expansion includes delta, gamma, vega, theta, and two cross-
+  sensitivities (vanna and charm) for a more complete attribution than a
+  pure first-order estimate. This is useful for stress testing and
+  "what-if" analysis across Greek components.
+
 These conventions assume all positions share the same underlying. For mixed
-underlyings, the net dollar figures should be interpreted with caution since
-they aggregate sensitivities to different spot prices.
+underlyings, net dollar figures and scenario P&L should be interpreted with
+caution since they aggregate sensitivities to different spot prices.
 """
 
 from __future__ import annotations
@@ -114,6 +122,149 @@ class PortfolioRisk:
     net_dollar_delta: float
     net_dollar_gamma: float
     n_positions: int
+
+
+@dataclass(frozen=True)
+class ScenarioPnL:
+    """Estimated portfolio P&L for a hypothetical market scenario.
+
+    Computed via a second-order Taylor expansion of portfolio value with
+    respect to spot (delta, gamma), implied volatility (vega), calendar
+    time (theta), and two cross-sensitivities (vanna, charm).
+
+    The expansion captures the dominant sources of P&L over short horizons
+    without requiring a full reprice of every position. Cross-sensitivity
+    terms (vanna and charm) are small for small moves but become material
+    when both dimensions move simultaneously (e.g., large spot gap AND vol
+    shift, common during macro events).
+
+    Attributes:
+        delta_pnl: P&L from the first-order spot move: delta * ds.
+        gamma_pnl: P&L from second-order convexity: 0.5 * gamma * ds^2.
+            Always non-negative for a long-gamma book, regardless of move
+            direction. Positive gamma benefits from both up and down moves.
+        vega_pnl: P&L from the implied vol shift. Vega is stored per 1%
+            absolute vol move, so this scales as vega * (dvol / 0.01).
+        theta_pnl: P&L from time decay: theta * dt_days. Theta is negative
+            for net long option books; dt_days positive means losing value.
+        vanna_pnl: Cross-sensitivity P&L: vanna * ds * dvol. Measures how
+            much P&L arises when both spot and vol move together. Relevant
+            for books with significant skew exposure.
+        charm_pnl: Cross-sensitivity P&L: charm * ds * dt_days. Measures
+            the additional spot sensitivity accumulated as delta drifts over
+            dt_days calendar days, applied to the spot move ds.
+        total_pnl: Arithmetic sum of all six components.
+        ds: Spot shift used (same units as Position.spot).
+        dvol: Implied vol shift in decimal units (e.g. 0.01 = +1 vol point).
+        dt_days: Calendar days elapsed (non-negative).
+    """
+
+    delta_pnl: float
+    gamma_pnl: float
+    vega_pnl: float
+    theta_pnl: float
+    vanna_pnl: float
+    charm_pnl: float
+    total_pnl: float
+    ds: float
+    dvol: float
+    dt_days: float
+
+
+def scenario_pnl(
+    risk: PortfolioRisk,
+    ds: float = 0.0,
+    dvol: float = 0.0,
+    dt_days: float = 0.0,
+) -> ScenarioPnL:
+    """Estimate portfolio P&L under a simultaneous market scenario.
+
+    Applies a second-order Taylor expansion using the net Greeks from a
+    PortfolioRisk object. The expansion decomposes P&L into six named
+    components, each attributable to a specific Greek:
+
+        P&L = delta*ds
+            + 0.5*gamma*ds^2
+            + vega*(dvol/0.01)
+            + theta*dt_days
+            + vanna*ds*dvol
+            + charm*ds*dt_days
+
+    Greek unit conventions (inherited from compute_greeks):
+      - delta: price change per $1 spot move (dimensionless fraction).
+      - gamma: delta change per $1 spot move.
+      - vega: price change per 1% absolute vol move (0.01 in decimal).
+        Dividing dvol by 0.01 converts the shift to the same scale.
+      - theta: price change per calendar day (negative for long options).
+      - vanna: delta change per unit sigma (decimal). Multiplied by ds*dvol.
+      - charm: delta change per calendar day. Multiplied by ds*dt_days.
+
+    The expansion is accurate to first order in dvol and dt_days and to
+    second order in ds. It does not account for vol-of-vol (volga),
+    higher-order spot terms, or carry effects. For large moves (ds/spot > 5%)
+    or long horizons (dt_days > 30), a full reprice is more reliable.
+
+    Args:
+        risk: Portfolio risk from aggregate_greeks, providing net Greeks.
+        ds: Spot price shift in the same units as Position.spot. Positive
+            for a spot increase, negative for a decrease. Defaults to 0.
+        dvol: Implied volatility shift in decimal units (e.g. 0.01 for +1
+            vol point, -0.02 for -2 vol points). Defaults to 0.
+        dt_days: Calendar days elapsed. Must be non-negative. Defaults to 0.
+
+    Returns:
+        ScenarioPnL with per-Greek P&L contributions and total.
+
+    Raises:
+        ValueError: If dt_days is negative.
+
+    Example:
+        Estimate the P&L of a straddle if spot rises $5, vol drops 2%,
+        and one day passes::
+
+            from optionview.portfolio import Position, aggregate_greeks, scenario_pnl
+
+            positions = [
+                Position(spot=100, strike=100, rate=0.05, volatility=0.25,
+                         expiry_years=0.25, option_type="call", quantity=10),
+                Position(spot=100, strike=100, rate=0.05, volatility=0.25,
+                         expiry_years=0.25, option_type="put", quantity=10),
+            ]
+            risk = aggregate_greeks(positions)
+            pnl = scenario_pnl(risk, ds=5.0, dvol=-0.02, dt_days=1.0)
+            print(f"Delta P&L:  {pnl.delta_pnl:+.2f}")
+            print(f"Gamma P&L:  {pnl.gamma_pnl:+.2f}")
+            print(f"Vega P&L:   {pnl.vega_pnl:+.2f}")
+            print(f"Theta P&L:  {pnl.theta_pnl:+.2f}")
+            print(f"Total P&L:  {pnl.total_pnl:+.2f}")
+    """
+    if dt_days < 0:
+        raise ValueError(f"dt_days must be non-negative, got {dt_days}")
+
+    g = risk.net_greeks
+
+    delta_pnl = g["delta"] * ds
+    gamma_pnl = 0.5 * g["gamma"] * ds ** 2
+    # vega stored per 1% absolute vol move (0.01 decimal); scale to actual dvol
+    vega_pnl = g["vega"] * (dvol / 0.01)
+    theta_pnl = g["theta"] * dt_days
+    vanna_pnl = g["vanna"] * ds * dvol
+    charm_pnl = g["charm"] * ds * dt_days
+
+    total = delta_pnl + gamma_pnl + vega_pnl + theta_pnl + vanna_pnl + charm_pnl
+
+    return ScenarioPnL(
+        delta_pnl=delta_pnl,
+        gamma_pnl=gamma_pnl,
+        vega_pnl=vega_pnl,
+        theta_pnl=theta_pnl,
+        vanna_pnl=vanna_pnl,
+        charm_pnl=charm_pnl,
+        total_pnl=total,
+        ds=ds,
+        dvol=dvol,
+        dt_days=dt_days,
+    )
 
 
 def aggregate_greeks(positions: list[Position]) -> PortfolioRisk:
