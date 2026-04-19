@@ -1195,6 +1195,279 @@ class TestPortfolio:
 
 
 # ---------------------------------------------------------------------------
+# Scenario P&L
+# ---------------------------------------------------------------------------
+
+class TestScenarioPnL:
+    """Tests for scenario_pnl and ScenarioPnL.
+
+    scenario_pnl applies a second-order Taylor expansion to estimate portfolio
+    P&L across simultaneous moves in spot, implied vol, and time. Tests verify:
+
+    - Algebraic identities: zero scenario yields zero P&L; total is the sum
+      of components; components are linear in the respective input parameters.
+    - Sign and direction: long gamma profits from large moves in either
+      direction; long theta bleeds over time; long vega profits from vol
+      expansion.
+    - Cross-sensitivity: vanna and charm contribute only when both dimensions
+      of their cross-partial move simultaneously.
+    - Edge cases: negative dt_days raises ValueError; empty portfolio gives
+      all-zero P&L for any scenario.
+    """
+
+    SPOT = 100.0
+    STRIKE = 100.0
+    RATE = 0.05
+    VOL = 0.20
+    T = 0.50      # 6-month option: avoids near-expiry Greek singularities
+
+    def _straddle(self, quantity: float = 1.0) -> "PortfolioRisk":
+        """ATM straddle: long call + long put, same strike and expiry."""
+        from optionview.portfolio import Position, aggregate_greeks
+        positions = [
+            Position(
+                spot=self.SPOT, strike=self.STRIKE, rate=self.RATE,
+                volatility=self.VOL, expiry_years=self.T,
+                option_type="call", quantity=quantity,
+            ),
+            Position(
+                spot=self.SPOT, strike=self.STRIKE, rate=self.RATE,
+                volatility=self.VOL, expiry_years=self.T,
+                option_type="put", quantity=quantity,
+            ),
+        ]
+        return aggregate_greeks(positions)
+
+    def _single_call(self, quantity: float = 1.0) -> "PortfolioRisk":
+        from optionview.portfolio import Position, aggregate_greeks
+        return aggregate_greeks([
+            Position(
+                spot=self.SPOT, strike=self.STRIKE, rate=self.RATE,
+                volatility=self.VOL, expiry_years=self.T,
+                option_type="call", quantity=quantity,
+            )
+        ])
+
+    # -- Zero scenario --
+
+    def test_zero_move_returns_zero_pnl(self) -> None:
+        """A zero scenario (ds=dvol=dt_days=0) must produce exactly zero P&L."""
+        from optionview.portfolio import scenario_pnl
+        risk = self._straddle()
+        pnl = scenario_pnl(risk, ds=0.0, dvol=0.0, dt_days=0.0)
+        assert pnl.delta_pnl == 0.0
+        assert pnl.gamma_pnl == 0.0
+        assert pnl.vega_pnl == 0.0
+        assert pnl.theta_pnl == 0.0
+        assert pnl.vanna_pnl == 0.0
+        assert pnl.charm_pnl == 0.0
+        assert pnl.total_pnl == 0.0
+
+    def test_total_equals_sum_of_components(self) -> None:
+        """total_pnl must equal the arithmetic sum of all six components."""
+        from optionview.portfolio import scenario_pnl
+        risk = self._straddle()
+        pnl = scenario_pnl(risk, ds=3.0, dvol=0.02, dt_days=2.0)
+        expected = (
+            pnl.delta_pnl + pnl.gamma_pnl + pnl.vega_pnl
+            + pnl.theta_pnl + pnl.vanna_pnl + pnl.charm_pnl
+        )
+        assert abs(pnl.total_pnl - expected) < 1e-12, (
+            f"total_pnl={pnl.total_pnl:.10f} != sum_of_components={expected:.10f}"
+        )
+
+    # -- Linear and quadratic scaling --
+
+    def test_delta_pnl_linear_in_ds(self) -> None:
+        """delta_pnl must scale linearly with ds (all else zero)."""
+        from optionview.portfolio import scenario_pnl
+        risk = self._single_call()
+        pnl1 = scenario_pnl(risk, ds=2.0)
+        pnl2 = scenario_pnl(risk, ds=4.0)
+        assert abs(pnl2.delta_pnl - 2.0 * pnl1.delta_pnl) < 1e-12, (
+            f"delta_pnl not linear: pnl(ds=2)={pnl1.delta_pnl:.8f}, "
+            f"pnl(ds=4)={pnl2.delta_pnl:.8f}"
+        )
+
+    def test_gamma_pnl_quadratic_in_ds(self) -> None:
+        """gamma_pnl must scale as ds^2: doubling ds quadruples the gamma contribution."""
+        from optionview.portfolio import scenario_pnl
+        risk = self._straddle()
+        pnl1 = scenario_pnl(risk, ds=2.0)
+        pnl2 = scenario_pnl(risk, ds=4.0)
+        assert abs(pnl2.gamma_pnl - 4.0 * pnl1.gamma_pnl) < 1e-12, (
+            f"gamma_pnl not quadratic: pnl(ds=2)={pnl1.gamma_pnl:.8f}, "
+            f"pnl(ds=4)={pnl2.gamma_pnl:.8f}"
+        )
+
+    def test_vega_pnl_linear_in_dvol(self) -> None:
+        """vega_pnl must scale linearly with dvol (all else zero)."""
+        from optionview.portfolio import scenario_pnl
+        risk = self._single_call()
+        pnl1 = scenario_pnl(risk, dvol=0.01)
+        pnl2 = scenario_pnl(risk, dvol=0.03)
+        assert abs(pnl2.vega_pnl - 3.0 * pnl1.vega_pnl) < 1e-12, (
+            f"vega_pnl not linear: pnl(dvol=1%)={pnl1.vega_pnl:.8f}, "
+            f"pnl(dvol=3%)={pnl2.vega_pnl:.8f}"
+        )
+
+    def test_theta_pnl_linear_in_dt_days(self) -> None:
+        """theta_pnl must scale linearly with dt_days (all else zero)."""
+        from optionview.portfolio import scenario_pnl
+        risk = self._single_call()
+        pnl1 = scenario_pnl(risk, dt_days=1.0)
+        pnl3 = scenario_pnl(risk, dt_days=3.0)
+        assert abs(pnl3.theta_pnl - 3.0 * pnl1.theta_pnl) < 1e-12, (
+            f"theta_pnl not linear: pnl(dt=1)={pnl1.theta_pnl:.8f}, "
+            f"pnl(dt=3)={pnl3.theta_pnl:.8f}"
+        )
+
+    # -- Greek signs and direction --
+
+    def test_long_gamma_benefits_from_up_move(self) -> None:
+        """Positive gamma (long straddle) must have positive gamma_pnl for a spot increase."""
+        from optionview.portfolio import scenario_pnl
+        risk = self._straddle()
+        assert risk.net_greeks["gamma"] > 0.0
+        pnl = scenario_pnl(risk, ds=5.0)
+        assert pnl.gamma_pnl > 0.0, (
+            f"Long gamma must benefit from spot up; gamma_pnl={pnl.gamma_pnl:.6f}"
+        )
+
+    def test_long_gamma_benefits_from_down_move(self) -> None:
+        """Positive gamma must also yield positive gamma_pnl for a spot decrease."""
+        from optionview.portfolio import scenario_pnl
+        risk = self._straddle()
+        pnl = scenario_pnl(risk, ds=-5.0)
+        assert pnl.gamma_pnl > 0.0, (
+            f"Long gamma must benefit from spot down; gamma_pnl={pnl.gamma_pnl:.6f}"
+        )
+
+    def test_long_vega_benefits_from_vol_increase(self) -> None:
+        """Positive vega (long option) must produce positive vega_pnl when vol rises."""
+        from optionview.portfolio import scenario_pnl
+        risk = self._single_call()
+        assert risk.net_greeks["vega"] > 0.0
+        pnl = scenario_pnl(risk, dvol=0.05)
+        assert pnl.vega_pnl > 0.0, (
+            f"Long vega must benefit from vol increase; vega_pnl={pnl.vega_pnl:.6f}"
+        )
+
+    def test_long_theta_is_negative_time_decay(self) -> None:
+        """Long options have negative theta: time passing produces a negative theta_pnl."""
+        from optionview.portfolio import scenario_pnl
+        risk = self._single_call()
+        assert risk.net_greeks["theta"] < 0.0
+        pnl = scenario_pnl(risk, dt_days=5.0)
+        assert pnl.theta_pnl < 0.0, (
+            f"Positive dt_days with negative theta must yield negative theta_pnl; "
+            f"theta_pnl={pnl.theta_pnl:.6f}"
+        )
+
+    # -- Cross-sensitivity terms --
+
+    def test_vanna_zero_when_one_input_is_zero(self) -> None:
+        """vanna_pnl must be zero when either ds or dvol is zero."""
+        from optionview.portfolio import scenario_pnl
+        risk = self._single_call()
+        pnl_no_ds = scenario_pnl(risk, ds=0.0, dvol=0.02)
+        pnl_no_dvol = scenario_pnl(risk, ds=3.0, dvol=0.0)
+        assert pnl_no_ds.vanna_pnl == 0.0, (
+            f"vanna_pnl must be zero when ds=0; got {pnl_no_ds.vanna_pnl}"
+        )
+        assert pnl_no_dvol.vanna_pnl == 0.0, (
+            f"vanna_pnl must be zero when dvol=0; got {pnl_no_dvol.vanna_pnl}"
+        )
+
+    def test_charm_zero_when_one_input_is_zero(self) -> None:
+        """charm_pnl must be zero when either ds or dt_days is zero."""
+        from optionview.portfolio import scenario_pnl
+        risk = self._single_call()
+        pnl_no_ds = scenario_pnl(risk, ds=0.0, dt_days=2.0)
+        pnl_no_dt = scenario_pnl(risk, ds=3.0, dt_days=0.0)
+        assert pnl_no_ds.charm_pnl == 0.0, (
+            f"charm_pnl must be zero when ds=0; got {pnl_no_ds.charm_pnl}"
+        )
+        assert pnl_no_dt.charm_pnl == 0.0, (
+            f"charm_pnl must be zero when dt_days=0; got {pnl_no_dt.charm_pnl}"
+        )
+
+    # -- Scenario inputs stored on result --
+
+    def test_scenario_inputs_stored_on_result(self) -> None:
+        """ScenarioPnL must record the ds, dvol, and dt_days inputs verbatim."""
+        from optionview.portfolio import scenario_pnl
+        risk = self._single_call()
+        pnl = scenario_pnl(risk, ds=-2.5, dvol=0.03, dt_days=7.0)
+        assert pnl.ds == -2.5
+        assert pnl.dvol == 0.03
+        assert pnl.dt_days == 7.0
+
+    # -- Edge cases --
+
+    def test_negative_dt_days_raises(self) -> None:
+        """Negative dt_days is physically meaningless and must raise ValueError."""
+        from optionview.portfolio import scenario_pnl
+        risk = self._single_call()
+        with pytest.raises(ValueError, match="dt_days"):
+            scenario_pnl(risk, dt_days=-1.0)
+
+    def test_empty_portfolio_zero_pnl_any_scenario(self) -> None:
+        """An empty portfolio has no Greeks and must produce zero P&L for any scenario."""
+        from optionview.portfolio import aggregate_greeks, scenario_pnl
+        risk = aggregate_greeks([])
+        pnl = scenario_pnl(risk, ds=10.0, dvol=0.05, dt_days=3.0)
+        assert pnl.total_pnl == 0.0
+        assert pnl.delta_pnl == 0.0
+        assert pnl.gamma_pnl == 0.0
+        assert pnl.vega_pnl == 0.0
+        assert pnl.theta_pnl == 0.0
+        assert pnl.vanna_pnl == 0.0
+        assert pnl.charm_pnl == 0.0
+
+    def test_short_position_inverts_all_pnl_components(self) -> None:
+        """Short position with same parameters as long must have exactly negated P&L."""
+        from optionview.portfolio import scenario_pnl
+        long_risk = self._single_call(quantity=1.0)
+        short_risk = self._single_call(quantity=-1.0)
+        long_pnl = scenario_pnl(long_risk, ds=3.0, dvol=0.01, dt_days=1.0)
+        short_pnl = scenario_pnl(short_risk, ds=3.0, dvol=0.01, dt_days=1.0)
+        for attr in ("delta_pnl", "gamma_pnl", "vega_pnl", "theta_pnl",
+                     "vanna_pnl", "charm_pnl", "total_pnl"):
+            assert abs(getattr(long_pnl, attr) + getattr(short_pnl, attr)) < 1e-12, (
+                f"{attr}: long={getattr(long_pnl, attr):.8f}, "
+                f"short={getattr(short_pnl, attr):.8f}; expected exact negation"
+            )
+
+    def test_delta_pnl_matches_net_greeks_times_ds(self) -> None:
+        """delta_pnl must equal net_greeks['delta'] * ds exactly.
+
+        This directly verifies that the Taylor expansion uses the correct Greek
+        and that no scaling factor is missing or misapplied. Uses a straddle
+        at a non-zero risk-free rate, where net delta is positive (call delta
+        exceeds the absolute put delta due to the forward drift component of d1).
+        """
+        from optionview.portfolio import scenario_pnl
+        ds = 3.0
+        risk = self._straddle()
+        pnl = scenario_pnl(risk, ds=ds)
+        expected = risk.net_greeks["delta"] * ds
+        assert abs(pnl.delta_pnl - expected) < 1e-12, (
+            f"delta_pnl={pnl.delta_pnl:.10f} != net_delta*ds={expected:.10f}"
+        )
+
+    def test_gamma_pnl_symmetric_in_ds(self) -> None:
+        """gamma_pnl for +ds and -ds must be identical (0.5*gamma*ds^2 is even in ds)."""
+        from optionview.portfolio import scenario_pnl
+        risk = self._straddle()
+        pnl_up = scenario_pnl(risk, ds=4.0)
+        pnl_dn = scenario_pnl(risk, ds=-4.0)
+        assert abs(pnl_up.gamma_pnl - pnl_dn.gamma_pnl) < 1e-12, (
+            f"gamma_pnl asymmetric: up={pnl_up.gamma_pnl:.8f}, dn={pnl_dn.gamma_pnl:.8f}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Greeks numerical verification via finite differences
 # ---------------------------------------------------------------------------
 
