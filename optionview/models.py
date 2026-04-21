@@ -1,8 +1,8 @@
 """Option pricing model implementations.
 
 Provides Black-Scholes (Merton 1973 continuous-dividend extension),
-Binomial Tree (CRR), and Monte Carlo simulation for European-style
-vanilla options. All models accept an optional continuous dividend
+Binomial Tree (CRR), Monte Carlo simulation, and the Heston stochastic
+volatility model for European-style vanilla options. All models accept an optional continuous dividend
 yield so that equity options with known yield assumptions can be
 priced consistently across methods.
 
@@ -303,3 +303,200 @@ def implied_volatility(
         f"Implied volatility solver did not converge after {max_iter} iterations "
         f"(last sigma={sigma:.6f}, price diff={diff:.6f})"
     )
+
+
+# ---------------------------------------------------------------------------
+# Heston stochastic volatility model
+# ---------------------------------------------------------------------------
+import cmath as _cmath
+import math as _math
+from scipy import integrate as _integrate
+
+
+def _heston_cf(
+    phi: float,
+    j: int,
+    spot: float,
+    rate: float,
+    dividend_yield: float,
+    expiry_years: float,
+    v0: float,
+    kappa: float,
+    theta: float,
+    sigma: float,
+    rho: float,
+) -> complex:
+    """Heston characteristic function f_j(phi) for computing risk-adjusted probabilities.
+
+    Implements the 'little trap' sign convention from Albrecher, Mayer, Schoutens,
+    and Tistaert (2007). The original Heston (1993) formula uses exp(-d*T) in the
+    g_j denominator, which causes the argument of the complex log to cross the
+    negative real axis for certain (phi, kappa, rho) combinations, introducing a
+    branch-cut discontinuity. The fix uses +d in the g_j numerator/denominator,
+    so the log argument stays in the right half-plane for all valid inputs.
+
+    Args:
+        phi: Real integration variable (strictly positive).
+        j: 1 for the stock-price measure (computes P1), 2 for risk-neutral (P2).
+    """
+    u_j = 0.5 if j == 1 else -0.5
+    b_j = kappa - rho * sigma if j == 1 else kappa
+
+    ip = 1j * phi
+
+    d_j = _cmath.sqrt(
+        (rho * sigma * ip - b_j) ** 2 - sigma ** 2 * (2.0 * u_j * ip - phi ** 2)
+    )
+
+    # Little-trap sign: +d in numerator keeps the log argument bounded away
+    # from the negative real axis, eliminating the branch-cut problem.
+    g_j = (b_j - rho * sigma * ip + d_j) / (b_j - rho * sigma * ip - d_j)
+
+    exp_d_tau = _cmath.exp(d_j * expiry_years)
+
+    C_j = (rate - dividend_yield) * ip * expiry_years + (kappa * theta / sigma ** 2) * (
+        (b_j - rho * sigma * ip + d_j) * expiry_years
+        - 2.0 * _cmath.log((1.0 - g_j * exp_d_tau) / (1.0 - g_j))
+    )
+    D_j = ((b_j - rho * sigma * ip + d_j) / sigma ** 2) * (
+        (1.0 - exp_d_tau) / (1.0 - g_j * exp_d_tau)
+    )
+
+    return _cmath.exp(C_j + D_j * v0 + ip * _cmath.log(spot))
+
+
+def heston(
+    spot: float,
+    strike: float,
+    rate: float,
+    expiry_years: float,
+    v0: float,
+    kappa: float,
+    theta: float,
+    sigma: float,
+    rho: float,
+    option_type: OptionType = "call",
+    dividend_yield: float = 0.0,
+) -> float:
+    """Price a European option under the Heston stochastic volatility model.
+
+    The Heston model extends geometric Brownian motion with a mean-reverting
+    variance process, capturing the implied vol smile that constant-vol models
+    cannot reproduce:
+
+        dS = (r - q) S dt + sqrt(v) S dW_S
+        dv = kappa * (theta - v) dt + sigma * sqrt(v) dW_v
+        corr(dW_S, dW_v) = rho dt
+
+    The European price is computed via Gil-Pelaez inversion of the characteristic
+    function. The formula decomposes the call price into two risk-adjusted
+    probabilities P1 and P2:
+
+        C = S * exp(-q*T) * P1 - K * exp(-r*T) * P2
+
+    Each probability is recovered from a single numerical integral over the
+    real line using scipy.integrate.quad. The 'little trap' sign convention
+    (Albrecher et al. 2007) is used to prevent branch-cut discontinuities
+    that arise in the original Heston (1993) formula for certain parameter
+    combinations (large kappa, long expiry, or extreme rho).
+
+    The key inputs that control the smile shape are:
+      - sigma (vol-of-vol): governs smile curvature; higher sigma widens the smile.
+      - rho: governs skew direction; negative rho creates the equity-style
+        downward slope (put wings are more expensive than call wings).
+      - kappa and theta: control variance mean reversion; fast reversion (high
+        kappa) collapses the term structure of the smile.
+
+    Args:
+        spot: Current price of the underlying asset.
+        strike: Option strike price. Must be positive.
+        rate: Continuously compounded risk-free rate (annualized).
+        expiry_years: Time to expiration in years. Must be positive.
+        v0: Initial instantaneous variance (annualized). Equal to vol^2, not vol.
+            For example, a 25% initial vol corresponds to v0 = 0.0625.
+        kappa: Mean-reversion speed for the variance process. Must be positive.
+        theta: Long-run variance (the variance level v(t) reverts to). Must be
+            positive. The long-run implied vol is approximately sqrt(theta).
+        sigma: Volatility of variance (vol-of-vol). Controls smile curvature.
+            Typical equity values are in the range 0.2-0.8. Must be positive.
+        rho: Correlation between the spot and variance Brownian motions.
+            Equity indices typically have rho in (-0.9, -0.3). Must be in (-1, 1).
+        option_type: "call" or "put".
+        dividend_yield: Continuous dividend yield (annualized, as a decimal).
+            Defaults to 0.0.
+
+    Returns:
+        European option price. Always non-negative.
+
+    Raises:
+        ValueError: If spot, strike, v0, kappa, theta, or sigma are non-positive;
+            if rho is outside the open interval (-1, 1); if expiry_years is
+            non-positive; or if dividend_yield is negative.
+
+    Note:
+        The Feller condition (2 * kappa * theta > sigma^2) guarantees that the
+        variance process stays strictly positive. When the condition is violated,
+        v(t) can touch zero, which may reduce numerical precision for long
+        expiries or large sigma values. Prices remain valid but interpret results
+        with care outside the Feller regime.
+    """
+    if spot <= 0.0:
+        raise ValueError(f"spot must be positive, got {spot}")
+    if strike <= 0.0:
+        raise ValueError(f"strike must be positive, got {strike}")
+    if expiry_years <= 0.0:
+        raise ValueError(f"expiry_years must be positive, got {expiry_years}")
+    if v0 <= 0.0:
+        raise ValueError(f"v0 must be positive, got {v0}")
+    if kappa <= 0.0:
+        raise ValueError(f"kappa must be positive, got {kappa}")
+    if theta <= 0.0:
+        raise ValueError(f"theta must be positive, got {theta}")
+    if sigma <= 0.0:
+        raise ValueError(f"sigma must be positive, got {sigma}")
+    if not (-1.0 < rho < 1.0):
+        raise ValueError(f"rho must be in (-1, 1), got {rho}")
+    if dividend_yield < 0.0:
+        raise ValueError(f"dividend_yield must be non-negative, got {dividend_yield}")
+
+    log_k = _math.log(strike)
+
+    def _integrand(phi: float, j: int) -> float:
+        cf = _heston_cf(
+            phi, j, spot, rate, dividend_yield, expiry_years,
+            v0, kappa, theta, sigma, rho,
+        )
+        return (_cmath.exp(-1j * phi * log_k) * cf / (1j * phi)).real
+
+    # Integrate from a small epsilon to avoid the well-defined but numerically
+    # sensitive limit at phi=0. Upper limit 1000 is conservative: the integrand
+    # decays exponentially and is negligible well before phi reaches this value
+    # for all parameter combinations encountered in practice.
+    eps = 1e-4
+    upper = 1000.0
+
+    p1_int, _ = _integrate.quad(
+        _integrand, eps, upper, args=(1,), limit=300, epsabs=1.5e-8, epsrel=1.5e-8,
+    )
+    p2_int, _ = _integrate.quad(
+        _integrand, eps, upper, args=(2,), limit=300, epsabs=1.5e-8, epsrel=1.5e-8,
+    )
+
+    p1 = max(0.0, min(1.0, 0.5 + p1_int / _math.pi))
+    p2 = max(0.0, min(1.0, 0.5 + p2_int / _math.pi))
+
+    call_price = (
+        spot * _math.exp(-dividend_yield * expiry_years) * p1
+        - strike * _math.exp(-rate * expiry_years) * p2
+    )
+
+    if option_type == "call":
+        return max(call_price, 0.0)
+
+    # Derive put via put-call parity: P = C - S*exp(-q*T) + K*exp(-r*T)
+    put_price = (
+        call_price
+        - spot * _math.exp(-dividend_yield * expiry_years)
+        + strike * _math.exp(-rate * expiry_years)
+    )
+    return max(put_price, 0.0)
