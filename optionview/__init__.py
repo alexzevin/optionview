@@ -1,8 +1,8 @@
 """optionview - Compare option pricing models against live market data."""
 
-__version__ = "0.1.5"
+__version__ = "0.1.6"
 
-from optionview.models import black_scholes, binomial_tree, monte_carlo, implied_volatility
+from optionview.models import black_scholes, binomial_tree, monte_carlo, implied_volatility, heston
 from optionview.greeks import compute_greeks
 from optionview.fetcher import (
     fetch_option_chain,
@@ -36,6 +36,7 @@ __all__ = [
     "binomial_tree",
     "monte_carlo",
     "implied_volatility",
+    "heston",
     "compute_greeks",
     "fetch_option_chain",
     "fetch_spot_price",
