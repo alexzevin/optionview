@@ -29,6 +29,7 @@ from optionview.greeks import compute_greeks
 from optionview.models import (
     binomial_tree,
     black_scholes,
+    heston,
     implied_volatility,
     monte_carlo,
 )
@@ -1828,3 +1829,331 @@ class TestInterpolateIV:
         iv = surface.interpolate_iv(exp, mid_lm)
         expected = (pts[0].iv + pts[1].iv) / 2.0
         assert abs(iv - expected) < 1e-10
+
+
+# ---------------------------------------------------------------------------
+# Heston stochastic volatility model
+# ---------------------------------------------------------------------------
+
+
+class TestHeston:
+    """Tests for the Heston stochastic volatility model.
+
+    Organized into three groups:
+    1. Put-call parity: an analytical identity the implementation must satisfy
+       to floating-point precision, since puts are derived from calls via parity.
+    2. Smile shape: verifies that rho and sigma drive the expected smile slope
+       and curvature, checked by extracting Black-Scholes implied vols from
+       Heston prices at off-ATM strikes.
+    3. Input validation: each parameter has a domain constraint; every violated
+       constraint must raise ValueError with a message identifying the parameter.
+    """
+
+    # Reference parameters: equity-index style with moderate stochastic vol.
+    SPOT: float = 100.0
+    STRIKE: float = 100.0
+    RATE: float = 0.05
+    EXPIRY: float = 0.5
+    V0: float = 0.04      # initial variance, equal to (20% vol)^2
+    KAPPA: float = 2.0    # mean-reversion speed
+    THETA: float = 0.04   # long-run variance, equal to (20% vol)^2
+    SIGMA: float = 0.4    # vol-of-vol
+    RHO: float = -0.7     # spot-variance correlation, equity-like downward skew
+
+    def _call(self, **kwargs: float) -> float:
+        params: dict = dict(
+            spot=self.SPOT, strike=self.STRIKE, rate=self.RATE,
+            expiry_years=self.EXPIRY, v0=self.V0, kappa=self.KAPPA,
+            theta=self.THETA, sigma=self.SIGMA, rho=self.RHO,
+            option_type="call",
+        )
+        params.update(kwargs)
+        return heston(**params)
+
+    def _put(self, **kwargs: float) -> float:
+        params: dict = dict(
+            spot=self.SPOT, strike=self.STRIKE, rate=self.RATE,
+            expiry_years=self.EXPIRY, v0=self.V0, kappa=self.KAPPA,
+            theta=self.THETA, sigma=self.SIGMA, rho=self.RHO,
+            option_type="put",
+        )
+        params.update(kwargs)
+        return heston(**params)
+
+    # -- Basic sanity ----------------------------------------------------
+
+    def test_call_price_positive(self) -> None:
+        """ATM call price must be strictly positive with any reasonable parameters."""
+        assert self._call() > 0.0
+
+    def test_put_price_positive(self) -> None:
+        """ATM put price must be strictly positive with any reasonable parameters."""
+        assert self._put() > 0.0
+
+    # -- Put-call parity -------------------------------------------------
+
+    def test_put_call_parity_no_dividends(self) -> None:
+        """C - P = S - K*exp(-r*T) must hold exactly when q = 0.
+
+        The implementation derives puts from the call price via the analytic
+        parity relation, so this identity holds to floating-point precision
+        rather than up to some numerical integration tolerance.
+        """
+        call = self._call()
+        put = self._put()
+        lhs = call - put
+        rhs = self.SPOT - self.STRIKE * math.exp(-self.RATE * self.EXPIRY)
+        assert abs(lhs - rhs) < 1e-8, (
+            f"Heston put-call parity (q=0): C-P={lhs:.10f}, expected={rhs:.10f}, "
+            f"diff={abs(lhs - rhs):.2e}"
+        )
+
+    def test_put_call_parity_with_dividends(self) -> None:
+        """C - P = S*exp(-q*T) - K*exp(-r*T) must hold exactly when q > 0."""
+        q = 0.025
+        call = heston(
+            self.SPOT, self.STRIKE, self.RATE, self.EXPIRY,
+            self.V0, self.KAPPA, self.THETA, self.SIGMA, self.RHO,
+            "call", dividend_yield=q,
+        )
+        put = heston(
+            self.SPOT, self.STRIKE, self.RATE, self.EXPIRY,
+            self.V0, self.KAPPA, self.THETA, self.SIGMA, self.RHO,
+            "put", dividend_yield=q,
+        )
+        lhs = call - put
+        rhs = (
+            self.SPOT * math.exp(-q * self.EXPIRY)
+            - self.STRIKE * math.exp(-self.RATE * self.EXPIRY)
+        )
+        assert abs(lhs - rhs) < 1e-8, (
+            f"Heston put-call parity (q={q}): C-P={lhs:.10f}, expected={rhs:.10f}, "
+            f"diff={abs(lhs - rhs):.2e}"
+        )
+
+    # -- Black-Scholes degenerate limit ----------------------------------
+
+    def test_converges_to_bs_at_zero_vol_of_vol(self) -> None:
+        """When sigma (vol-of-vol) approaches zero and v0 = theta, the Heston
+        model has deterministic, constant variance and must price identically to
+        Black-Scholes at vol = sqrt(v0).
+
+        rho is set to zero to eliminate any correlation effect that could survive
+        even with tiny sigma. The tolerance is 1 cent; the limit is approached
+        continuously, so exact equality is not expected at sigma = 0.001.
+        """
+        v = 0.04          # 20% vol for both v0 and theta
+        tiny_sigma = 0.001
+        h_call = heston(
+            self.SPOT, self.STRIKE, self.RATE, self.EXPIRY,
+            v0=v, kappa=2.0, theta=v, sigma=tiny_sigma, rho=0.0,
+            option_type="call",
+        )
+        bs_call = black_scholes(
+            self.SPOT, self.STRIKE, self.RATE,
+            volatility=math.sqrt(v), expiry_years=self.EXPIRY, option_type="call",
+        )
+        assert abs(h_call - bs_call) < 0.01, (
+            f"Heston does not converge to BS at sigma->0: "
+            f"heston={h_call:.6f}, bs={bs_call:.6f}, diff={abs(h_call - bs_call):.6f}"
+        )
+
+    # -- Smile shape verification ----------------------------------------
+
+    def test_negative_rho_creates_negative_skew(self) -> None:
+        """With rho < 0, the Heston smile slopes downward: OTM put implied vol
+        exceeds OTM call implied vol at equidistant strikes.
+
+        This is the defining characteristic of equity-index options. The negative
+        spot-variance correlation means that down moves coincide with rising
+        variance, making OTM puts relatively more expensive than OTM calls.
+        """
+        otm_put_strike = 90.0
+        otm_call_strike = 110.0
+
+        otm_put_price = heston(
+            self.SPOT, otm_put_strike, self.RATE, self.EXPIRY,
+            self.V0, self.KAPPA, self.THETA, self.SIGMA, self.RHO,
+            "put",
+        )
+        otm_call_price = heston(
+            self.SPOT, otm_call_strike, self.RATE, self.EXPIRY,
+            self.V0, self.KAPPA, self.THETA, self.SIGMA, self.RHO,
+            "call",
+        )
+
+        iv_put = implied_volatility(
+            otm_put_price, self.SPOT, otm_put_strike, self.RATE, self.EXPIRY, "put"
+        )
+        iv_call = implied_volatility(
+            otm_call_price, self.SPOT, otm_call_strike, self.RATE, self.EXPIRY, "call"
+        )
+
+        assert iv_put > iv_call, (
+            f"Expected downward skew (rho={self.RHO}): "
+            f"IV(K=90)={iv_put:.4f} should exceed IV(K=110)={iv_call:.4f}"
+        )
+
+    def test_positive_rho_creates_positive_skew(self) -> None:
+        """With rho > 0, the skew reverses: OTM call IV exceeds OTM put IV.
+
+        Positive correlation means up moves coincide with rising variance,
+        making call wings relatively more expensive. This pattern is typical
+        of commodity markets rather than equity indices.
+        """
+        otm_put_strike = 90.0
+        otm_call_strike = 110.0
+
+        otm_put_price = heston(
+            self.SPOT, otm_put_strike, self.RATE, self.EXPIRY,
+            self.V0, self.KAPPA, self.THETA, self.SIGMA, rho=0.7,
+            option_type="put",
+        )
+        otm_call_price = heston(
+            self.SPOT, otm_call_strike, self.RATE, self.EXPIRY,
+            self.V0, self.KAPPA, self.THETA, self.SIGMA, rho=0.7,
+            option_type="call",
+        )
+
+        iv_put = implied_volatility(
+            otm_put_price, self.SPOT, otm_put_strike, self.RATE, self.EXPIRY, "put"
+        )
+        iv_call = implied_volatility(
+            otm_call_price, self.SPOT, otm_call_strike, self.RATE, self.EXPIRY, "call"
+        )
+
+        assert iv_call > iv_put, (
+            f"Expected upward skew (rho=0.7): "
+            f"IV(K=110)={iv_call:.4f} should exceed IV(K=90)={iv_put:.4f}"
+        )
+
+    def test_higher_vol_of_vol_increases_otm_put_iv(self) -> None:
+        """A higher vol-of-vol (sigma) produces a wider smile: deeply OTM put IV rises.
+
+        The sigma parameter controls smile curvature. A higher sigma means the
+        variance process is more volatile, which fattens the distribution tails
+        and makes far-OTM options more expensive relative to ATM options.
+        """
+        otm_put_strike = 85.0
+        common: dict = dict(
+            spot=self.SPOT, strike=otm_put_strike, rate=self.RATE,
+            expiry_years=self.EXPIRY, v0=self.V0, kappa=self.KAPPA,
+            theta=self.THETA, rho=self.RHO, option_type="put",
+        )
+        price_lo = heston(**common, sigma=0.2)
+        price_hi = heston(**common, sigma=0.7)
+
+        iv_lo = implied_volatility(
+            price_lo, self.SPOT, otm_put_strike, self.RATE, self.EXPIRY, "put"
+        )
+        iv_hi = implied_volatility(
+            price_hi, self.SPOT, otm_put_strike, self.RATE, self.EXPIRY, "put"
+        )
+
+        assert iv_hi > iv_lo, (
+            f"Higher vol-of-vol should raise OTM put IV: "
+            f"sigma=0.2 -> IV={iv_lo:.4f}, sigma=0.7 -> IV={iv_hi:.4f}"
+        )
+
+    # -- Dividend sensitivity --------------------------------------------
+
+    def test_dividend_lowers_call_price(self) -> None:
+        """Continuous dividend yield reduces the risk-neutral forward, lowering call value."""
+        call_low = heston(
+            self.SPOT, self.STRIKE, self.RATE, self.EXPIRY,
+            self.V0, self.KAPPA, self.THETA, self.SIGMA, self.RHO,
+            "call", dividend_yield=0.01,
+        )
+        call_high = heston(
+            self.SPOT, self.STRIKE, self.RATE, self.EXPIRY,
+            self.V0, self.KAPPA, self.THETA, self.SIGMA, self.RHO,
+            "call", dividend_yield=0.05,
+        )
+        assert call_high < call_low
+
+    def test_dividend_raises_put_price(self) -> None:
+        """Continuous dividend yield lowers the forward, raising put value."""
+        put_low = heston(
+            self.SPOT, self.STRIKE, self.RATE, self.EXPIRY,
+            self.V0, self.KAPPA, self.THETA, self.SIGMA, self.RHO,
+            "put", dividend_yield=0.01,
+        )
+        put_high = heston(
+            self.SPOT, self.STRIKE, self.RATE, self.EXPIRY,
+            self.V0, self.KAPPA, self.THETA, self.SIGMA, self.RHO,
+            "put", dividend_yield=0.05,
+        )
+        assert put_high > put_low
+
+    # -- Input validation ------------------------------------------------
+
+    def test_invalid_spot_raises(self) -> None:
+        with pytest.raises(ValueError, match="spot"):
+            heston(
+                0.0, self.STRIKE, self.RATE, self.EXPIRY,
+                self.V0, self.KAPPA, self.THETA, self.SIGMA, self.RHO,
+            )
+
+    def test_invalid_strike_raises(self) -> None:
+        with pytest.raises(ValueError, match="strike"):
+            heston(
+                self.SPOT, -1.0, self.RATE, self.EXPIRY,
+                self.V0, self.KAPPA, self.THETA, self.SIGMA, self.RHO,
+            )
+
+    def test_invalid_expiry_raises(self) -> None:
+        with pytest.raises(ValueError, match="expiry"):
+            heston(
+                self.SPOT, self.STRIKE, self.RATE, 0.0,
+                self.V0, self.KAPPA, self.THETA, self.SIGMA, self.RHO,
+            )
+
+    def test_invalid_v0_raises(self) -> None:
+        with pytest.raises(ValueError, match="v0"):
+            heston(
+                self.SPOT, self.STRIKE, self.RATE, self.EXPIRY,
+                0.0, self.KAPPA, self.THETA, self.SIGMA, self.RHO,
+            )
+
+    def test_invalid_kappa_raises(self) -> None:
+        with pytest.raises(ValueError, match="kappa"):
+            heston(
+                self.SPOT, self.STRIKE, self.RATE, self.EXPIRY,
+                self.V0, 0.0, self.THETA, self.SIGMA, self.RHO,
+            )
+
+    def test_invalid_theta_raises(self) -> None:
+        with pytest.raises(ValueError, match="theta"):
+            heston(
+                self.SPOT, self.STRIKE, self.RATE, self.EXPIRY,
+                self.V0, self.KAPPA, 0.0, self.SIGMA, self.RHO,
+            )
+
+    def test_invalid_sigma_raises(self) -> None:
+        with pytest.raises(ValueError, match="sigma"):
+            heston(
+                self.SPOT, self.STRIKE, self.RATE, self.EXPIRY,
+                self.V0, self.KAPPA, self.THETA, 0.0, self.RHO,
+            )
+
+    def test_invalid_rho_at_minus_one_raises(self) -> None:
+        with pytest.raises(ValueError, match="rho"):
+            heston(
+                self.SPOT, self.STRIKE, self.RATE, self.EXPIRY,
+                self.V0, self.KAPPA, self.THETA, self.SIGMA, -1.0,
+            )
+
+    def test_invalid_rho_at_one_raises(self) -> None:
+        with pytest.raises(ValueError, match="rho"):
+            heston(
+                self.SPOT, self.STRIKE, self.RATE, self.EXPIRY,
+                self.V0, self.KAPPA, self.THETA, self.SIGMA, 1.0,
+            )
+
+    def test_negative_dividend_raises(self) -> None:
+        with pytest.raises(ValueError, match="dividend"):
+            heston(
+                self.SPOT, self.STRIKE, self.RATE, self.EXPIRY,
+                self.V0, self.KAPPA, self.THETA, self.SIGMA, self.RHO,
+                "call", dividend_yield=-0.01,
+            )
