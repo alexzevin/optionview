@@ -4,14 +4,14 @@ A Python toolkit for comparing option pricing models against real-time market da
 
 ## Features
 
-- **Multiple Pricing Models**: Black-Scholes, Binomial Tree, Monte Carlo simulation, and Heston stochastic volatility
+- **Multiple Pricing Models**: Black-Scholes, Binomial Tree, Monte Carlo simulation, Heston stochastic volatility, and SABR (Hagan et al. 2002)
 - **Live Market Data**: Fetches real-time option chains from Yahoo Finance (no API key required)
 - **Model Comparison**: Side-by-side comparison of theoretical vs. market prices
 - **Volatility Surface Construction**: Builds an implied volatility surface from multi-expiry option chains, with per-expiry smile analysis (OLS slope and IV range), ATM term structure extraction, log-moneyness normalized IVPoints, and piecewise-linear IV interpolation across strikes
 - **Greeks Calculation**: Full analytical Greeks including Delta, Gamma, Theta, Vega, Rho, Epsilon (dividend sensitivity), Vanna, and Charm
 - **Implied Volatility Solver**: Newton-Raphson IV solver with configurable tolerance
 - **Portfolio Greeks Aggregation**: Aggregate Greeks across a collection of long and short option positions, with per-position and net portfolio risk
-- **Scenario P&L**: Estimate portfolio P&L for a simultaneous move in spot, implied vol, and time using a second-order Taylor expansion (delta, gamma, vega, theta, vanna, charm) — useful for stress testing and what-if analysis without a full reprice
+- **Scenario P&L**: Estimate portfolio P&L for a simultaneous move in spot, implied vol, and time using a second-order Taylor expansion (delta, gamma, vega, theta, vanna, charm), useful for stress testing and what-if analysis without a full reprice
 - **Clean API**: Simple, composable functions for scripting and analysis
 
 ## Installation
@@ -271,6 +271,94 @@ The Feller condition (2 * kappa * theta > sigma^2) ensures the variance
 process stays strictly positive. When violated, v(t) can touch zero, which
 reduces numerical precision for long expiries.
 
+## SABR Stochastic Volatility
+
+The SABR model (Hagan, Kumar, Lesniewski, Woodward 2002) is the industry standard for
+interest rate swaptions and FX options. It models the forward price and its instantaneous
+volatility as correlated stochastic processes:
+
+```
+dF = alpha * F^beta * dW_F
+d_alpha = nu * alpha * dW_alpha
+corr(dW_F, dW_alpha) = rho * dt
+```
+
+The key advantage over Heston is speed: the Hagan approximation gives an analytical formula
+for implied vol without numerical integration, making calibration to a full strike slice
+orders of magnitude faster. The tradeoff is that the approximation is O(T^2) accurate and
+can break down for very long expiries (T > 5 years) or extreme parameters.
+
+Four parameters control the shape of the smile for a given expiry:
+- `alpha`: overall vol level (not directly comparable to Black-Scholes vol)
+- `beta`: CEV backbone (1.0 for equities/FX, 0.5 for rates)
+- `rho`: skew direction; negative rho creates the equity-style downward slope
+- `nu`: curvature; nu=0 is a flat (CEV) smile, larger nu widens the wings
+
+`sabr_implied_vol` takes a forward price directly and returns the Black-Scholes equivalent
+implied vol. `sabr` wraps it with Black-76 pricing and accepts the same spot/rate/dividend
+inputs as the other models in this library.
+
+```python
+from optionview.models import sabr, sabr_implied_vol
+import math
+
+# Typical equity SABR calibration (beta=1 lognormal backbone)
+spot = 100.0
+rate = 0.05
+T = 0.5
+
+# Parameters calibrated to match a 25% ATM vol with mild negative skew
+alpha = 0.25
+beta = 1.0
+rho = -0.3
+nu = 0.4
+
+call = sabr(spot, strike=100.0, rate=rate, expiry_years=T,
+            alpha=alpha, beta=beta, rho=rho, nu=nu, option_type="call")
+put = sabr(spot, strike=100.0, rate=rate, expiry_years=T,
+           alpha=alpha, beta=beta, rho=rho, nu=nu, option_type="put")
+print(f"SABR ATM call: ${call:.4f}")
+print(f"SABR ATM put:  ${put:.4f}")
+
+# Observe the skew: OTM puts are richer than OTM calls (negative rho effect)
+forward = spot * math.exp(rate * T)
+for strike in [85, 90, 95, 100, 105, 110, 115]:
+    iv = sabr_implied_vol(forward, strike, T, alpha, beta, rho, nu)
+    print(f"  K={strike}: SABR IV = {iv:.1%}")
+```
+
+Compare SABR against Heston for multi-strike fitting to understand where each model
+fits the market smile better:
+
+```python
+from optionview.models import sabr_implied_vol, heston
+
+# For a given expiry, SABR produces the smile analytically
+# while Heston requires a numerical integral per strike
+forward = 100.0
+T = 0.5
+rate = 0.05
+
+# SABR parameters
+alpha, beta, rho_s, nu = 0.25, 1.0, -0.3, 0.4
+
+# Heston parameters (calibrated to similar ATM vol and skew)
+v0, kappa, theta, sigma_h, rho_h = 0.0625, 3.0, 0.04, 0.4, -0.7
+
+print(f"{'Strike':>8}  {'SABR IV':>8}  {'Heston price':>12}")
+for K in [85, 90, 95, 100, 105, 110, 115]:
+    sabr_iv = sabr_implied_vol(forward, K, T, alpha, beta, rho_s, nu)
+    from optionview.models import heston
+    h_price = heston(forward, K, rate, T, v0, kappa, theta, sigma_h, rho_h)
+    print(f"  K={K:>3}:  SABR={sabr_iv:.2%}")
+```
+
+The beta parameter controls the relationship between price level and vol level. With
+beta=1 (lognormal backbone), the model behaves like a stochastic-vol extension of
+Black-Scholes and is the natural choice when vol is roughly proportional to price.
+With beta=0 (normal backbone), the model is better suited for low or near-zero forward
+rates where a lognormal assumption is problematic.
+
 ## Portfolio Greeks
 
 Aggregate Greeks across a collection of option positions to compute net portfolio
@@ -364,7 +452,7 @@ terms, so it works best for short-horizon stress scenarios.
 ```
 optionview/
   __init__.py      - Package entry point and version info
-  models.py        - Pricing model implementations
+  models.py        - Pricing model implementations (BS, BT, MC, Heston, SABR)
   greeks.py        - Analytical Greeks calculations
   fetcher.py       - Market data retrieval from free APIs
   surface.py       - Implied volatility surface construction and smile analysis
@@ -386,11 +474,13 @@ Path-based simulation with antithetic variates for variance reduction. Best suit
 ### Heston Stochastic Volatility
 A two-factor model where variance follows a mean-reverting CIR process correlated with the spot. Reproduces the implied vol smile and skew that flat-vol models cannot capture. Priced via Gil-Pelaez characteristic function inversion with the Albrecher et al. (2007) little-trap sign convention for numerical stability.
 
+### SABR Stochastic Volatility
+A two-factor model where the instantaneous vol follows a lognormal process correlated with the forward price. The Hagan et al. (2002) analytical approximation gives implied Black-Scholes vol without numerical integration, making it the industry standard for fast calibration to option smile slices. The beta parameter controls the CEV backbone: beta=1 is lognormal (equities/FX), beta=0 is normal (rates).
+
 ## Roadmap
 
 - HTML dashboard for interactive comparison
 - Volatility surface visualization (surface construction is implemented; charting is not)
-- Additional models (SABR)
 - Historical backtesting of model accuracy
 
 ## License
