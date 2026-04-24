@@ -500,3 +500,239 @@ def heston(
         + strike * _math.exp(-rate * expiry_years)
     )
     return max(put_price, 0.0)
+
+
+# ---------------------------------------------------------------------------
+# SABR stochastic volatility model (Hagan, Kumar, Lesniewski, Woodward 2002)
+# ---------------------------------------------------------------------------
+
+def sabr_implied_vol(
+    forward: float,
+    strike: float,
+    expiry_years: float,
+    alpha: float,
+    beta: float,
+    rho: float,
+    nu: float,
+) -> float:
+    """Compute SABR implied volatility using the Hagan et al. (2002) approximation.
+
+    The SABR model (Stochastic Alpha Beta Rho) describes the risk-neutral
+    dynamics of a forward price F and its instantaneous volatility:
+
+        dF = alpha * F^beta * dW_F
+        d_alpha = nu * alpha * dW_alpha
+        corr(dW_F, dW_alpha) = rho * dt
+
+    The Hagan approximation gives a closed-form Black-Scholes implied vol
+    without numerical integration, accurate to O(T^2). It is the industry
+    standard for interest rate swaptions and FX options because it calibrates
+    rapidly to multi-strike slices and naturally reproduces the skew (via rho)
+    and curvature (via nu) observed in liquid option markets.
+
+    The implementation handles three structurally distinct cases:
+
+    1. ATM (F ~ K) or no stochastic vol (nu=0): the z/chi(z) ratio limits
+       to 1 via L'Hopital and the formula collapses to the pure-CEV level.
+    2. Off-ATM with nu > 0: the full z/chi(z) factor modulates the slope
+       and curvature of the smile across strikes.
+    3. Degenerate chi numerator: raises ValueError to signal that the
+       parameter combination is outside the stable approximation region.
+
+    The time-correction term (1 + expansion * T) captures the leading-order
+    effect of mean reversion in alpha. For T > 2 years the O(T^2) truncation
+    error grows and a more exact formula (Obloj 2008 correction) may be
+    preferable.
+
+    Args:
+        forward: Forward price of the underlying (F = S * exp((r-q)*T)).
+        strike: Option strike price. Must be positive.
+        expiry_years: Time to expiration in years. Must be positive.
+        alpha: Initial instantaneous volatility. Sets the overall vol level
+            for this expiry slice. Must be positive.
+        beta: CEV elasticity exponent in [0, 1]. beta=0 is the normal
+            (Bachelier) backbone; beta=1 is the lognormal (Black-76)
+            backbone. For equities beta=1.0 is common; for interest rates
+            beta=0.5 is the standard choice.
+        rho: Correlation between forward and vol Brownian motions.
+            Negative rho produces downward-sloping skew (equity-like put
+            premium). Must be strictly inside (-1, 1).
+        nu: Vol-of-vol parameter. Controls smile curvature. nu=0 degenerates
+            to a flat (CEV) smile. Must be non-negative.
+
+    Returns:
+        Annualized implied Black-Scholes volatility as a decimal.
+
+    Raises:
+        ValueError: If forward, strike, or expiry_years are non-positive; if
+            alpha is non-positive; if beta is outside [0, 1]; if rho is
+            outside (-1, 1); if nu is negative; or if the approximation
+            yields a non-positive or degenerate implied vol.
+
+    Note:
+        The Hagan approximation can produce slightly negative implied vols
+        for very deep OTM strikes when nu is large and T is long. This
+        raises ValueError. In practice, such strikes carry negligible
+        liquidity and the approximation breaks down before the vol goes
+        negative for sensible calibrations.
+    """
+    if forward <= 0.0:
+        raise ValueError(f"forward must be positive, got {forward}")
+    if strike <= 0.0:
+        raise ValueError(f"strike must be positive, got {strike}")
+    if expiry_years <= 0.0:
+        raise ValueError(f"expiry_years must be positive, got {expiry_years}")
+    if alpha <= 0.0:
+        raise ValueError(f"alpha must be positive, got {alpha}")
+    if not (0.0 <= beta <= 1.0):
+        raise ValueError(f"beta must be in [0, 1], got {beta}")
+    if not (-1.0 < rho < 1.0):
+        raise ValueError(f"rho must be in (-1, 1), got {rho}")
+    if nu < 0.0:
+        raise ValueError(f"nu must be non-negative, got {nu}")
+
+    one_minus_beta = 1.0 - beta
+    log_fk = _math.log(forward / strike)
+    fk_mid = (forward * strike) ** (one_minus_beta / 2.0)
+
+    # Denominator: CEV backbone expansion in log(F/K).
+    # Accounts for the curvature of the F^beta payoff between F and K.
+    fk_denom = fk_mid * (
+        1.0
+        + (one_minus_beta ** 2 / 24.0) * log_fk ** 2
+        + (one_minus_beta ** 4 / 1920.0) * log_fk ** 4
+    )
+
+    # Time-correction: leading-order O(T) adjustment for vol-of-vol effects.
+    # This is the term inside the braces in equation (2.17) of Hagan et al.
+    time_correction = 1.0 + (
+        (one_minus_beta ** 2 / 24.0) * (alpha ** 2) / (fk_mid ** 2)
+        + (rho * beta * nu * alpha / (4.0 * fk_mid))
+        + ((2.0 - 3.0 * rho ** 2) / 24.0) * nu ** 2
+    ) * expiry_years
+
+    if nu == 0.0 or abs(log_fk) < 1e-7:
+        # ATM or no stochastic vol: z/chi(z) -> 1, formula simplifies.
+        sigma_b = (alpha / fk_denom) * time_correction
+    else:
+        # z parameterizes the distance from ATM in the SABR metric.
+        z = (nu / alpha) * fk_mid * log_fk
+
+        # chi(z): log-ratio of the two roots of the chi equation.
+        disc = _math.sqrt(max(1.0 - 2.0 * rho * z + z * z, 0.0))
+        chi_num = disc + z - rho
+        if chi_num <= 0.0:
+            raise ValueError(
+                f"SABR approximation is degenerate for these parameters "
+                f"(chi numerator={chi_num:.4f}). Reduce |rho| or |z| "
+                f"(large log(F/K) combined with nu near |rho|*alpha can cause this)."
+            )
+        chi_z = _math.log(chi_num / (1.0 - rho))
+
+        # z/chi(z): the ratio that corrects the flat-smile vol for skew.
+        # The limit as chi_z -> 0 is 1.0 (handled above for near-ATM).
+        z_over_chi = z / chi_z if abs(chi_z) > 1e-14 else 1.0
+
+        sigma_b = (alpha / fk_denom) * z_over_chi * time_correction
+
+    if sigma_b <= 0.0:
+        raise ValueError(
+            f"SABR approximation produced non-positive implied vol ({sigma_b:.8f}). "
+            f"The parameter combination is likely outside the valid region for "
+            f"this expiry (forward={forward}, strike={strike}, T={expiry_years}, "
+            f"alpha={alpha}, beta={beta}, rho={rho}, nu={nu})."
+        )
+
+    return float(sigma_b)
+
+
+def sabr(
+    spot: float,
+    strike: float,
+    rate: float,
+    expiry_years: float,
+    alpha: float,
+    beta: float,
+    rho: float,
+    nu: float,
+    option_type: OptionType = "call",
+    dividend_yield: float = 0.0,
+) -> float:
+    """Price a European option under the SABR stochastic volatility model.
+
+    Computes the SABR implied volatility via the Hagan et al. (2002)
+    analytical approximation, then prices using the Black-76 formula on the
+    risk-neutral forward price F = S * exp((r - q) * T):
+
+        C = exp(-r*T) * [F * N(d1) - K * N(d2)]
+        P = exp(-r*T) * [K * N(-d2) - F * N(-d1)]
+
+    where d1 and d2 are computed from the SABR-derived implied vol.
+
+    The SABR model is the industry standard for interest rate swaptions and
+    FX options because calibrating four parameters (alpha, beta, rho, nu) to
+    a single expiry slice is fast, reliable, and produces a smooth vol smile
+    consistent with put-call parity. The model natively captures the negative
+    skew (negative rho) and curvature (positive nu) observed in equity and
+    rate option markets without the multi-dimensional numerical integration
+    required by Heston.
+
+    Beta controls the backbone: beta=1 gives a lognormal backbone (prices
+    proportional to spot, consistent with Black-Scholes for single-strike
+    fitting) while beta=0 gives a normal backbone (prices independent of
+    spot level, more appropriate for near-zero rates). For equities, beta=1
+    is the natural choice; for rate options, beta=0.5 is conventional.
+
+    Args:
+        spot: Current price of the underlying asset.
+        strike: Option strike price. Must be positive.
+        rate: Risk-free interest rate (annualized, as a decimal).
+        expiry_years: Time to expiration in years. Must be positive.
+        alpha: Initial instantaneous volatility level. Not directly comparable
+            to the Black-Scholes vol: the relationship to ATM implied vol
+            depends on beta and the ATM forward level.
+        beta: CEV elasticity exponent in [0, 1].
+        rho: Spot-vol correlation. Negative rho creates downward-sloping
+            skew (OTM puts more expensive than OTM calls). Must be in (-1, 1).
+        nu: Vol-of-vol. Controls smile curvature. nu=0 is a flat smile.
+            Must be non-negative.
+        option_type: "call" or "put".
+        dividend_yield: Continuous dividend yield (annualized, as a decimal).
+            Defaults to 0.0.
+
+    Returns:
+        European option price. Always non-negative.
+
+    Raises:
+        ValueError: If any input fails validation or if the SABR
+            approximation is degenerate for the given parameters.
+    """
+    if spot <= 0.0:
+        raise ValueError(f"spot must be positive, got {spot}")
+    if dividend_yield < 0.0:
+        raise ValueError(f"dividend_yield must be non-negative, got {dividend_yield}")
+
+    forward = spot * _math.exp((rate - dividend_yield) * expiry_years)
+
+    # SABR implied vol (validates alpha, beta, rho, nu, strike, expiry internally)
+    sigma_bs = sabr_implied_vol(forward, strike, expiry_years, alpha, beta, rho, nu)
+
+    # Black-76 pricing: discount factor and standardized moneyness
+    from scipy.stats import norm as _norm
+
+    discount = _math.exp(-rate * expiry_years)
+    sqrt_t = _math.sqrt(expiry_years)
+    vol_sqrt_t = sigma_bs * sqrt_t
+
+    if vol_sqrt_t < 1e-12:
+        # Degenerate limit: return discounted intrinsic value
+        if option_type == "call":
+            return float(max(discount * (forward - strike), 0.0))
+        return float(max(discount * (strike - forward), 0.0))
+
+    d1 = (_math.log(forward / strike) + 0.5 * sigma_bs ** 2 * expiry_years) / vol_sqrt_t
+    d2 = d1 - vol_sqrt_t
+
+    if option_type == "call":
+        return float(discount * (forward * _norm.cdf(d1) - strike * _norm.cdf(d2)))
+    return float(discount * (strike * _norm.cdf(-d2) - forward * _norm.cdf(-d1)))
