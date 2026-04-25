@@ -2157,3 +2157,402 @@ class TestHeston:
                 self.V0, self.KAPPA, self.THETA, self.SIGMA, self.RHO,
                 "call", dividend_yield=-0.01,
             )
+
+
+# ---------------------------------------------------------------------------
+# SABR stochastic volatility model
+# ---------------------------------------------------------------------------
+
+from optionview.models import sabr, sabr_implied_vol
+
+
+class TestSABRImpliedVol:
+    """Tests for sabr_implied_vol: the Hagan et al. (2002) approximation."""
+
+    # Canonical parameters used across tests unless overridden.
+    FORWARD = 100.0
+    T = 0.5
+    ALPHA = 0.25
+    BETA = 1.0    # lognormal backbone
+    RHO = -0.3
+    NU = 0.4
+
+    def test_atm_zero_nu_equals_alpha(self) -> None:
+        """When nu=0 and F=K with beta=1, sabr_implied_vol returns alpha exactly.
+
+        For beta=1 (lognormal backbone): fk_mid = F^0 = 1, log_fk = 0.
+        All nu-dependent terms in the time correction vanish, leaving
+        sigma_b = alpha / 1 * 1 = alpha.
+        """
+        iv = sabr_implied_vol(
+            forward=self.FORWARD,
+            strike=self.FORWARD,
+            expiry_years=self.T,
+            alpha=self.ALPHA,
+            beta=1.0,
+            rho=self.RHO,
+            nu=0.0,
+        )
+        assert abs(iv - self.ALPHA) < 1e-10, (
+            f"ATM, nu=0, beta=1 should give iv=alpha={self.ALPHA}, got {iv}"
+        )
+
+    def test_near_atm_limit_is_continuous(self) -> None:
+        """IV should be stable and continuous as strike approaches forward.
+
+        The z/chi(z) ratio has a removable singularity at z=0 (ATM). Verifies
+        that the implementation smoothly handles the near-ATM regime without
+        discontinuities or NaNs.
+        """
+        for offset in (1e-1, 1e-3, 1e-5, 1e-7):
+            iv_above = sabr_implied_vol(
+                self.FORWARD, self.FORWARD + offset, self.T,
+                self.ALPHA, self.BETA, self.RHO, self.NU,
+            )
+            iv_below = sabr_implied_vol(
+                self.FORWARD, self.FORWARD - offset, self.T,
+                self.ALPHA, self.BETA, self.RHO, self.NU,
+            )
+            assert iv_above > 0.0
+            assert iv_below > 0.0
+            # Near-ATM values should be close to ATM for small offsets
+            if offset <= 1e-3:
+                iv_atm = sabr_implied_vol(
+                    self.FORWARD, self.FORWARD, self.T,
+                    self.ALPHA, self.BETA, self.RHO, self.NU,
+                )
+                assert abs(iv_above - iv_atm) < 0.001
+                assert abs(iv_below - iv_atm) < 0.001
+
+    def test_negative_rho_gives_downward_skew(self) -> None:
+        """With rho < 0, OTM puts have higher IV than equidistant OTM calls.
+
+        Negative spot-vol correlation means variance rises when the spot falls,
+        making downside strikes more expensive than upside strikes at the same
+        distance from the forward.
+        """
+        iv_otm_put = sabr_implied_vol(
+            self.FORWARD, 90.0, self.T, self.ALPHA, self.BETA, -0.5, self.NU,
+        )
+        iv_otm_call = sabr_implied_vol(
+            self.FORWARD, 110.0, self.T, self.ALPHA, self.BETA, -0.5, self.NU,
+        )
+        assert iv_otm_put > iv_otm_call, (
+            f"Expected downward skew (iv_put > iv_call) with rho=-0.5, "
+            f"got iv_put={iv_otm_put:.4f} iv_call={iv_otm_call:.4f}"
+        )
+
+    def test_positive_rho_gives_upward_skew(self) -> None:
+        """With rho > 0, OTM calls have higher IV than equidistant OTM puts."""
+        iv_otm_put = sabr_implied_vol(
+            self.FORWARD, 90.0, self.T, self.ALPHA, self.BETA, 0.5, self.NU,
+        )
+        iv_otm_call = sabr_implied_vol(
+            self.FORWARD, 110.0, self.T, self.ALPHA, self.BETA, 0.5, self.NU,
+        )
+        assert iv_otm_call > iv_otm_put, (
+            f"Expected upward skew (iv_call > iv_put) with rho=+0.5, "
+            f"got iv_call={iv_otm_call:.4f} iv_put={iv_otm_put:.4f}"
+        )
+
+    def test_positive_nu_gives_u_shaped_smile_with_zero_rho(self) -> None:
+        """With rho=0 and nu > 0, the smile is U-shaped: wings are richer than ATM.
+
+        Symmetric curvature (rho=0 removes skew) means OTM strikes on both sides
+        carry more IV than the ATM level. This is the pure vol-of-vol effect.
+        """
+        iv_atm = sabr_implied_vol(
+            self.FORWARD, self.FORWARD, self.T, self.ALPHA, self.BETA, 0.0, 0.4,
+        )
+        iv_low = sabr_implied_vol(
+            self.FORWARD, 85.0, self.T, self.ALPHA, self.BETA, 0.0, 0.4,
+        )
+        iv_high = sabr_implied_vol(
+            self.FORWARD, 115.0, self.T, self.ALPHA, self.BETA, 0.0, 0.4,
+        )
+        assert iv_low > iv_atm, (
+            f"Left wing should be richer than ATM (rho=0): {iv_low:.4f} vs ATM={iv_atm:.4f}"
+        )
+        assert iv_high > iv_atm, (
+            f"Right wing should be richer than ATM (rho=0): {iv_high:.4f} vs ATM={iv_atm:.4f}"
+        )
+        # With rho=0 the formula is symmetric in log-moneyness
+        assert abs(iv_low - iv_high) < 0.002, (
+            f"Expected near-symmetric smile (rho=0) but got iv_low={iv_low:.4f} iv_high={iv_high:.4f}"
+        )
+
+    def test_zero_nu_gives_flat_smile(self) -> None:
+        """With nu=0, the smile is flat: all strikes share the same IV.
+
+        The SABR model degenerates to pure CEV when vol-of-vol is zero.
+        For beta=1 and nu=0, every strike returns alpha regardless of
+        distance from the forward (no stochastic vol effect to generate skew).
+        """
+        strikes = [80.0, 90.0, 100.0, 110.0, 120.0]
+        ivs = [
+            sabr_implied_vol(
+                self.FORWARD, k, self.T, self.ALPHA, 1.0, self.RHO, 0.0,
+            )
+            for k in strikes
+        ]
+        # All should equal alpha with nu=0, beta=1 (no log_fk adjustment for beta=1)
+        for k, iv in zip(strikes, ivs):
+            assert abs(iv - self.ALPHA) < 1e-8, (
+                f"Flat smile (nu=0, beta=1) failed at K={k}: iv={iv:.8f}, expected={self.ALPHA}"
+            )
+
+    def test_beta_lognormal_vs_normal_backbone_differ(self) -> None:
+        """beta=0 and beta=1 yield different implied vols for the same alpha.
+
+        The beta exponent controls the CEV backbone: the relationship between
+        forward price level and vol level. Different beta values produce
+        structurally different smile shapes even with identical alpha, rho, nu.
+        """
+        iv_lognormal = sabr_implied_vol(
+            self.FORWARD, self.FORWARD, self.T, self.ALPHA, 1.0, self.RHO, self.NU,
+        )
+        iv_normal = sabr_implied_vol(
+            self.FORWARD, self.FORWARD, self.T, self.ALPHA, 0.0, self.RHO, self.NU,
+        )
+        assert iv_lognormal != iv_normal, (
+            "beta=0 and beta=1 should produce different implied vols"
+        )
+        # Both must be positive
+        assert iv_lognormal > 0.0
+        assert iv_normal > 0.0
+
+    def test_returns_positive_iv_across_wide_strike_range(self) -> None:
+        """sabr_implied_vol returns positive IV for all strikes in a wide range."""
+        for strike in [60.0, 70.0, 80.0, 90.0, 100.0, 110.0, 120.0, 130.0, 140.0]:
+            iv = sabr_implied_vol(
+                self.FORWARD, strike, self.T, self.ALPHA, self.BETA, self.RHO, self.NU,
+            )
+            assert iv > 0.0, f"Expected positive IV at K={strike}, got {iv}"
+
+    def test_iv_positive_for_short_and_long_expiry(self) -> None:
+        """Implied vol stays positive for T from 0.1 to 2.0 years."""
+        for T in (0.1, 0.25, 0.5, 1.0, 2.0):
+            iv = sabr_implied_vol(
+                self.FORWARD, self.FORWARD, T, self.ALPHA, self.BETA, self.RHO, self.NU,
+            )
+            assert iv > 0.0, f"Expected positive IV at T={T}, got {iv}"
+            assert iv < 5.0, f"IV unreasonably large at T={T}: {iv}"
+
+    def test_invalid_forward_raises(self) -> None:
+        with pytest.raises(ValueError, match="forward"):
+            sabr_implied_vol(0.0, 100.0, 0.5, 0.25, 1.0, -0.3, 0.4)
+
+    def test_invalid_strike_raises(self) -> None:
+        with pytest.raises(ValueError, match="strike"):
+            sabr_implied_vol(100.0, -5.0, 0.5, 0.25, 1.0, -0.3, 0.4)
+
+    def test_invalid_expiry_raises(self) -> None:
+        with pytest.raises(ValueError, match="expiry"):
+            sabr_implied_vol(100.0, 100.0, 0.0, 0.25, 1.0, -0.3, 0.4)
+
+    def test_invalid_alpha_raises(self) -> None:
+        with pytest.raises(ValueError, match="alpha"):
+            sabr_implied_vol(100.0, 100.0, 0.5, 0.0, 1.0, -0.3, 0.4)
+
+    def test_invalid_beta_above_one_raises(self) -> None:
+        with pytest.raises(ValueError, match="beta"):
+            sabr_implied_vol(100.0, 100.0, 0.5, 0.25, 1.5, -0.3, 0.4)
+
+    def test_invalid_beta_below_zero_raises(self) -> None:
+        with pytest.raises(ValueError, match="beta"):
+            sabr_implied_vol(100.0, 100.0, 0.5, 0.25, -0.1, -0.3, 0.4)
+
+    def test_invalid_rho_at_boundary_raises(self) -> None:
+        with pytest.raises(ValueError, match="rho"):
+            sabr_implied_vol(100.0, 100.0, 0.5, 0.25, 1.0, 1.0, 0.4)
+
+    def test_invalid_rho_at_neg_boundary_raises(self) -> None:
+        with pytest.raises(ValueError, match="rho"):
+            sabr_implied_vol(100.0, 100.0, 0.5, 0.25, 1.0, -1.0, 0.4)
+
+    def test_invalid_nu_raises(self) -> None:
+        with pytest.raises(ValueError, match="nu"):
+            sabr_implied_vol(100.0, 100.0, 0.5, 0.25, 1.0, -0.3, -0.1)
+
+
+class TestSABRPricer:
+    """Tests for the sabr() wrapper: Black-76 pricing at SABR-implied vol."""
+
+    SPOT = 100.0
+    STRIKE = 105.0
+    RATE = 0.05
+    T = 0.5
+    ALPHA = 0.25
+    BETA = 1.0
+    RHO = -0.3
+    NU = 0.4
+
+    def test_put_call_parity(self) -> None:
+        """C - P = exp(-r*T) * (F - K) for any valid parameter set.
+
+        This is the fundamental no-arbitrage constraint for European options
+        under any model. The Black-76 formula within sabr() satisfies it exactly
+        since both legs use the same SABR-implied vol.
+        """
+        import math
+
+        call = sabr(
+            self.SPOT, self.STRIKE, self.RATE, self.T,
+            self.ALPHA, self.BETA, self.RHO, self.NU, "call",
+        )
+        put = sabr(
+            self.SPOT, self.STRIKE, self.RATE, self.T,
+            self.ALPHA, self.BETA, self.RHO, self.NU, "put",
+        )
+        forward = self.SPOT * math.exp(self.RATE * self.T)
+        expected = math.exp(-self.RATE * self.T) * (forward - self.STRIKE)
+        assert abs((call - put) - expected) < 1e-10, (
+            f"Put-call parity violated: C-P={call - put:.10f}, expected={expected:.10f}"
+        )
+
+    def test_put_call_parity_atm(self) -> None:
+        """ATM put-call parity: C - P = exp(-r*T) * (F - K) when F ~ K."""
+        import math
+
+        strike = self.SPOT * math.exp(self.RATE * self.T)  # ATM forward
+        call = sabr(
+            self.SPOT, strike, self.RATE, self.T,
+            self.ALPHA, self.BETA, self.RHO, self.NU, "call",
+        )
+        put = sabr(
+            self.SPOT, strike, self.RATE, self.T,
+            self.ALPHA, self.BETA, self.RHO, self.NU, "put",
+        )
+        # At ATM forward, C - P = 0
+        assert abs(call - put) < 1e-8, (
+            f"ATM put-call parity violated: C={call:.8f}, P={put:.8f}"
+        )
+
+    def test_agrees_with_black_scholes_at_sabr_iv(self) -> None:
+        """sabr() price equals black_scholes() at the SABR-implied vol.
+
+        The sabr() implementation applies Black-76 at the SABR-implied vol,
+        which is algebraically equivalent to black_scholes() with the same
+        vol and q=0. This test verifies the two paths agree to floating-point
+        precision, confirming there is no hidden discrepancy between the
+        pricing and vol extraction paths.
+        """
+        import math
+
+        forward = self.SPOT * math.exp(self.RATE * self.T)
+        sigma_sabr = sabr_implied_vol(
+            forward, self.STRIKE, self.T,
+            self.ALPHA, self.BETA, self.RHO, self.NU,
+        )
+        # black_scholes with q=0 is equivalent to Black-76
+        bs_price = black_scholes(
+            self.SPOT, self.STRIKE, self.RATE, sigma_sabr, self.T, "call",
+        )
+        sabr_price = sabr(
+            self.SPOT, self.STRIKE, self.RATE, self.T,
+            self.ALPHA, self.BETA, self.RHO, self.NU, "call",
+        )
+        assert abs(sabr_price - bs_price) < 1e-8, (
+            f"sabr() and black_scholes(sabr_iv) disagree: "
+            f"sabr={sabr_price:.8f}, bs={bs_price:.8f}"
+        )
+
+    def test_call_and_put_non_negative(self) -> None:
+        """Option prices are always non-negative."""
+        for option_type in ("call", "put"):
+            price = sabr(
+                self.SPOT, self.STRIKE, self.RATE, self.T,
+                self.ALPHA, self.BETA, self.RHO, self.NU,
+                option_type,  # type: ignore[arg-type]
+            )
+            assert price >= 0.0, f"{option_type} price negative: {price}"
+
+    def test_call_decreases_with_strike(self) -> None:
+        """Call price is strictly decreasing in strike (no-arbitrage monotonicity)."""
+        strikes = [85.0, 95.0, 100.0, 105.0, 115.0]
+        call_prices = [
+            sabr(
+                self.SPOT, k, self.RATE, self.T,
+                self.ALPHA, self.BETA, self.RHO, self.NU, "call",
+            )
+            for k in strikes
+        ]
+        for i in range(len(call_prices) - 1):
+            assert call_prices[i] > call_prices[i + 1], (
+                f"Call price not decreasing: K={strikes[i]} gives {call_prices[i]:.4f}, "
+                f"K={strikes[i+1]} gives {call_prices[i+1]:.4f}"
+            )
+
+    def test_put_increases_with_strike(self) -> None:
+        """Put price is strictly increasing in strike (no-arbitrage monotonicity)."""
+        strikes = [85.0, 95.0, 100.0, 105.0, 115.0]
+        put_prices = [
+            sabr(
+                self.SPOT, k, self.RATE, self.T,
+                self.ALPHA, self.BETA, self.RHO, self.NU, "put",
+            )
+            for k in strikes
+        ]
+        for i in range(len(put_prices) - 1):
+            assert put_prices[i] < put_prices[i + 1], (
+                f"Put price not increasing: K={strikes[i]} gives {put_prices[i]:.4f}, "
+                f"K={strikes[i+1]} gives {put_prices[i+1]:.4f}"
+            )
+
+    def test_dividend_yield_lowers_call_price(self) -> None:
+        """Higher dividend yield reduces call price (forward decreases)."""
+        call_no_div = sabr(
+            self.SPOT, self.STRIKE, self.RATE, self.T,
+            self.ALPHA, self.BETA, self.RHO, self.NU, "call",
+            dividend_yield=0.0,
+        )
+        call_with_div = sabr(
+            self.SPOT, self.STRIKE, self.RATE, self.T,
+            self.ALPHA, self.BETA, self.RHO, self.NU, "call",
+            dividend_yield=0.03,
+        )
+        assert call_no_div > call_with_div, (
+            f"Expected higher div yield to reduce call price: "
+            f"q=0 gives {call_no_div:.4f}, q=0.03 gives {call_with_div:.4f}"
+        )
+
+    def test_invalid_spot_raises(self) -> None:
+        with pytest.raises(ValueError, match="spot"):
+            sabr(0.0, 100.0, 0.05, 0.5, 0.25, 1.0, -0.3, 0.4)
+
+    def test_invalid_dividend_yield_raises(self) -> None:
+        with pytest.raises(ValueError, match="dividend"):
+            sabr(100.0, 100.0, 0.05, 0.5, 0.25, 1.0, -0.3, 0.4, dividend_yield=-0.01)
+
+    def test_invalid_alpha_propagates_from_sabr_iv(self) -> None:
+        """Input validation for alpha is enforced through sabr_implied_vol."""
+        with pytest.raises(ValueError):
+            sabr(100.0, 100.0, 0.05, 0.5, 0.0, 1.0, -0.3, 0.4)
+
+    def test_price_increases_with_vol_of_vol(self) -> None:
+        """Higher nu (vol-of-vol) increases both call and put prices for ATM options.
+
+        Greater stochastic vol increases the value of the optionality on the vol
+        process itself. For an ATM straddle owner (long gamma and vega), higher
+        vol-of-vol is beneficial because large moves in vol benefit the position
+        through the convexity of the payoff.
+        """
+        spot = 100.0
+        strike = 100.0  # ATM
+        rate = 0.05
+        T = 1.0
+        alpha, beta, rho = 0.25, 1.0, 0.0  # rho=0 to isolate nu effect
+
+        prices_low_nu = [
+            sabr(spot, strike, rate, T, alpha, beta, rho, 0.1, ot)
+            for ot in ("call", "put")
+        ]
+        prices_high_nu = [
+            sabr(spot, strike, rate, T, alpha, beta, rho, 0.6, ot)
+            for ot in ("call", "put")
+        ]
+        for i, option_type in enumerate(("call", "put")):
+            assert prices_high_nu[i] > prices_low_nu[i], (
+                f"Expected higher nu to increase {option_type} price: "
+                f"nu=0.1 gives {prices_low_nu[i]:.4f}, nu=0.6 gives {prices_high_nu[i]:.4f}"
+            )
