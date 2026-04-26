@@ -359,6 +359,97 @@ Black-Scholes and is the natural choice when vol is roughly proportional to pric
 With beta=0 (normal backbone), the model is better suited for low or near-zero forward
 rates where a lognormal assumption is problematic.
 
+
+## SABR Calibration
+
+Given an observed implied vol smile, `calibrate_sabr` fits the SABR parameters (alpha, rho, nu)
+to the market quotes while holding beta fixed. The result is a `SABRCalibration` dataclass
+containing the fitted parameters and fit quality metrics (RMSE and max absolute error per strike).
+
+Beta is held constant as a prior choice based on the underlying asset class: use beta=1.0 for
+equities and FX (lognormal backbone), beta=0.5 for interest rate swaptions (conventional), or
+beta=0.0 for the normal backbone near zero rates. Calibrating beta jointly with the other three
+parameters is ill-conditioned because rho and nu can partially absorb changes in beta.
+
+The typical workflow is to build a surface first, extract a single-expiry smile slice, convert
+each IVPoint to a (forward, strike, expiry_years, iv) tuple, and pass the list to `calibrate_sabr`.
+All quotes should share the same expiry; mixing expirations in a single call produces a meaningless
+fit because the SABR time-correction term is expiry-specific.
+
+```python
+import math
+from optionview.fetcher import fetch_option_chain, fetch_spot_price
+from optionview.surface import build_surface
+from optionview.models import calibrate_sabr
+
+ticker = "SPY"
+records = fetch_option_chain(ticker)
+spot = fetch_spot_price(ticker)
+rate = 0.05
+div_yield = 0.013
+
+surface = build_surface(records, spot, rate, div_yield, min_open_interest=50)
+exp = surface.expirations[0]
+
+# Compute the risk-neutral forward for this expiry
+t = next(p.expiry_years for p in surface.smile(exp))
+forward = spot * math.exp((rate - div_yield) * t)
+
+# Build (forward, strike, expiry_years, market_iv) tuples from one smile slice
+quotes = [
+    (forward, p.strike, p.expiry_years, p.iv)
+    for p in surface.smile(exp)
+]
+
+fit = calibrate_sabr(quotes, beta=1.0)
+
+print(f"Fitted parameters for {exp}:")
+print(f"  alpha = {fit.alpha:.4f}  (overall vol level)")
+print(f"  beta  = {fit.beta:.1f}    (fixed, lognormal backbone)")
+print(f"  rho   = {fit.rho:.4f}  (skew direction)")
+print(f"  nu    = {fit.nu:.4f}   (smile curvature / vol-of-vol)")
+print(f"  RMSE  = {fit.rmse:.4f}  ({fit.rmse * 100:.2f} vol points)")
+print(f"  max_abs_error = {fit.max_abs_error:.4f}")
+print(f"  calibrated to {fit.n_points} strikes")
+```
+
+Once calibrated, the fitted parameters can be used to interpolate the smile at any strike,
+including strikes not in the original option chain, without building a full surface:
+
+```python
+from optionview.models import sabr_implied_vol, sabr, calibrate_sabr
+
+# Re-use the calibrated parameters to price options at arbitrary strikes
+for K in [400, 420, 440, 460, 480, 500, 520, 540]:
+    iv = sabr_implied_vol(forward, K, t, fit.alpha, fit.beta, fit.rho, fit.nu)
+    call = sabr(spot, K, rate, t, fit.alpha, fit.beta, fit.rho, fit.nu,
+                option_type="call", dividend_yield=div_yield)
+    print(f"  K={K}: IV={iv:.2%}  call=${call:.4f}")
+```
+
+Calibration across multiple expirations produces a term structure of SABR parameters:
+
+```python
+# Calibrate one SABR slice per expiry to build the full parameter term structure
+for exp in surface.expirations:
+    t_exp = next(p.expiry_years for p in surface.smile(exp))
+    fwd_exp = spot * math.exp((rate - div_yield) * t_exp)
+    qs = [(fwd_exp, p.strike, p.expiry_years, p.iv) for p in surface.smile(exp)]
+    if len(qs) < 3:
+        continue  # need at least 3 strikes for a meaningful 3-parameter fit
+    fit_exp = calibrate_sabr(qs, beta=1.0)
+    print(
+        f"  {exp}  T={t_exp:.3f}  alpha={fit_exp.alpha:.3f}  "
+        f"rho={fit_exp.rho:.3f}  nu={fit_exp.nu:.3f}  "
+        f"RMSE={fit_exp.rmse:.4f}"
+    )
+```
+
+A common calibration failure mode is supplying market IVs in percentage form (e.g. 25.0)
+rather than decimal form (0.25). The optimizer will converge, but alpha will be approximately
+100 times too large, and RMSE will be reported in the same percentage-form units. Always verify
+that input market_iv values are decimals before calling `calibrate_sabr`.
+
 ## Portfolio Greeks
 
 Aggregate Greeks across a collection of option positions to compute net portfolio
