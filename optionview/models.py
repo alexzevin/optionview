@@ -736,3 +736,206 @@ def sabr(
     if option_type == "call":
         return float(discount * (forward * _norm.cdf(d1) - strike * _norm.cdf(d2)))
     return float(discount * (strike * _norm.cdf(-d2) - forward * _norm.cdf(-d1)))
+
+
+# ---------------------------------------------------------------------------
+# SABR calibration: fit (alpha, rho, nu) to a market-implied vol slice
+# ---------------------------------------------------------------------------
+from dataclasses import dataclass as _dataclass
+from typing import Sequence as _Sequence
+from scipy import optimize as _optimize
+
+
+@_dataclass(frozen=True)
+class SABRCalibration:
+    """Fitted SABR parameters from calibrating to a market implied vol slice.
+
+    Attributes:
+        alpha: Fitted initial volatility level. Sets the overall vol scale for
+            this expiry slice; not directly comparable to Black-Scholes vol
+            because the relationship depends on beta and the forward level.
+        beta: Fixed CEV exponent supplied to calibrate_sabr (not optimized).
+        rho: Fitted spot-vol correlation. Negative values produce a downward-
+            sloping skew (OTM puts richer than OTM calls), typical for equity
+            and FX options.
+        nu: Fitted vol-of-vol. Controls smile curvature; nu=0 collapses to a
+            flat CEV smile. Typical equity values are in the range 0.1 to 1.5.
+        rmse: Root mean squared error between fitted SABR IVs and market IVs,
+            in the same units as the input market_iv values (decimal vol,
+            e.g. 0.005 means 0.5 vol-point RMSE).
+        max_abs_error: Largest single-strike absolute IV error in decimal vol.
+            Useful for detecting outlier strikes that the model fits poorly.
+        n_points: Number of market quotes included in the calibration.
+    """
+
+    alpha: float
+    beta: float
+    rho: float
+    nu: float
+    rmse: float
+    max_abs_error: float
+    n_points: int
+
+
+def calibrate_sabr(
+    market_quotes: "_Sequence[tuple[float, float, float, float]]",
+    beta: float = 1.0,
+    alpha_init: float = 0.25,
+    rho_init: float = -0.3,
+    nu_init: float = 0.4,
+) -> "SABRCalibration":
+    """Fit SABR (alpha, rho, nu) to observed Black-Scholes implied volatilities.
+
+    Holding beta fixed, solves:
+
+        min_{alpha, rho, nu}  sum_i [sigma_SABR(F_i, K_i, T, alpha, beta, rho, nu)
+                                     - sigma_market_i]^2
+
+    using scipy.optimize.minimize with the L-BFGS-B method and explicit parameter
+    bounds. Beta is fixed as a prior choice based on the underlying asset class;
+    calibrating beta jointly with the other three parameters is ill-conditioned
+    because rho and nu can partially compensate for changes in beta.
+
+    Parameter values that produce degenerate SABR approximations (e.g. extreme
+    rho combined with large log(F/K)) are penalized with a large surrogate error
+    rather than propagating exceptions, so the optimizer steers away from invalid
+    regions without aborting.
+
+    Typical workflow: build a VolatilitySurface, extract a single-expiry slice
+    with surface.smile(expiration), convert to (forward, strike, expiry_years,
+    iv) tuples, and pass to this function. All quotes in market_quotes should
+    share the same expiry; mixing expirations in a single call produces a
+    meaningless fit because the time-correction term is expiry-specific.
+
+    Args:
+        market_quotes: Sequence of (forward, strike, expiry_years, market_iv)
+            tuples. forward is the risk-neutral forward price for this expiry:
+            F = S * exp((r - q) * T). market_iv must be a positive decimal
+            (e.g. 0.25 for 25% implied vol). All tuples should share the same
+            expiry_years within floating-point precision.
+        beta: Fixed CEV exponent in [0, 1]. Defaults to 1.0 (lognormal backbone,
+            appropriate for equities and FX). Use 0.5 for interest rate options
+            or 0.0 for the normal backbone near zero rates.
+        alpha_init: Initial guess for alpha. A good starting point is the ATM
+            implied vol for the target expiry. Defaults to 0.25.
+        rho_init: Initial guess for rho. Defaults to -0.3 (mild negative skew).
+        nu_init: Initial guess for nu. Defaults to 0.4 (moderate curvature).
+
+    Returns:
+        SABRCalibration with fitted alpha, rho, nu and fit quality metrics
+        (rmse, max_abs_error, n_points).
+
+    Raises:
+        ValueError: If market_quotes is empty; if beta is outside [0, 1]; or if
+            any individual quote contains a non-positive forward, strike,
+            expiry_years, or market_iv.
+        RuntimeError: If the optimizer converges to a point with RMSE above 1%
+            (100 bps), indicating a genuine calibration failure rather than
+            routine optimizer tolerance noise.
+
+    Example:
+        Calibrate to a SPY near-dated expiry after building a surface:
+
+            from optionview.fetcher import fetch_option_chain, fetch_spot_price
+            from optionview.surface import build_surface
+            from optionview.models import calibrate_sabr
+            import math
+
+            records = fetch_option_chain("SPY")
+            spot = fetch_spot_price("SPY")
+            rate = 0.05
+            div_yield = 0.013
+
+            surface = build_surface(records, spot, rate, div_yield)
+            exp = surface.expirations[0]
+            t = [p.expiry_years for p in surface.smile(exp)][0]
+            forward = spot * math.exp((rate - div_yield) * t)
+
+            quotes = [
+                (forward, p.strike, p.expiry_years, p.iv)
+                for p in surface.smile(exp)
+            ]
+
+            fit = calibrate_sabr(quotes, beta=1.0)
+            print(f"alpha={fit.alpha:.4f}  rho={fit.rho:.4f}  nu={fit.nu:.4f}")
+            print(f"RMSE={fit.rmse:.4f}  max_err={fit.max_abs_error:.4f}")
+    """
+    if not market_quotes:
+        raise ValueError("market_quotes must be non-empty.")
+    if not (0.0 <= beta <= 1.0):
+        raise ValueError(f"beta must be in [0, 1], got {beta}")
+
+    for i, (fwd, k, t, iv) in enumerate(market_quotes):
+        if fwd <= 0.0:
+            raise ValueError(f"market_quotes[{i}]: forward must be positive, got {fwd}")
+        if k <= 0.0:
+            raise ValueError(f"market_quotes[{i}]: strike must be positive, got {k}")
+        if t <= 0.0:
+            raise ValueError(f"market_quotes[{i}]: expiry_years must be positive, got {t}")
+        if iv <= 0.0:
+            raise ValueError(f"market_quotes[{i}]: market_iv must be positive, got {iv}")
+
+    n = len(market_quotes)
+    # Large per-point penalty for parameter combinations that produce degenerate
+    # SABR approximations; chosen to be 10x larger than a typical IV error.
+    _PENALTY = 1.0
+
+    def _objective(params: "np.ndarray") -> float:
+        a, rho_, nu_ = float(params[0]), float(params[1]), float(params[2])
+        sse = 0.0
+        for fwd, k, t, market_iv in market_quotes:
+            try:
+                model_iv = sabr_implied_vol(fwd, k, t, a, beta, rho_, nu_)
+                sse += (model_iv - market_iv) ** 2
+            except (ValueError, ZeroDivisionError):
+                sse += _PENALTY ** 2
+        return sse
+
+    bounds = [
+        (1e-4, 5.0),     # alpha: strictly positive, cap prevents runaway fits
+        (-0.999, 0.999), # rho: open interval (-1, 1)
+        (1e-6, 5.0),     # nu: non-negative (small epsilon avoids ATM degeneracy test)
+    ]
+    x0 = np.array([alpha_init, rho_init, nu_init])
+
+    result = _optimize.minimize(
+        _objective,
+        x0=x0,
+        method="L-BFGS-B",
+        bounds=bounds,
+        options={"ftol": 1e-14, "gtol": 1e-8, "maxiter": 2000},
+    )
+
+    # Accept the result unless RMSE exceeds 1% (100 bps), which signals a genuine
+    # calibration failure rather than normal optimizer convergence noise.
+    if not result.success and result.fun > n * 0.01 ** 2:
+        raise RuntimeError(
+            f"SABR calibration did not converge: {result.message}. "
+            f"Final SSE={result.fun:.6f}. Verify that market_quotes spans a single "
+            f"expiry and that market_iv values are in decimal form (e.g. 0.25, not 25)."
+        )
+
+    alpha_fit = float(result.x[0])
+    rho_fit = float(result.x[1])
+    nu_fit = float(result.x[2])
+
+    errors = []
+    for fwd, k, t, market_iv in market_quotes:
+        try:
+            model_iv = sabr_implied_vol(fwd, k, t, alpha_fit, beta, rho_fit, nu_fit)
+            errors.append(abs(model_iv - market_iv))
+        except (ValueError, ZeroDivisionError):
+            errors.append(float(_PENALTY))
+
+    rmse = float(_math.sqrt(sum(e ** 2 for e in errors) / n))
+    max_abs = float(max(errors))
+
+    return SABRCalibration(
+        alpha=alpha_fit,
+        beta=beta,
+        rho=rho_fit,
+        nu=nu_fit,
+        rmse=rmse,
+        max_abs_error=max_abs,
+        n_points=n,
+    )
