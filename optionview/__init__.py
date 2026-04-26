@@ -1,8 +1,18 @@
 """optionview - Compare option pricing models against live market data."""
 
-__version__ = "0.1.7"
+__version__ = "0.1.8"
 
-from optionview.models import black_scholes, binomial_tree, monte_carlo, implied_volatility, heston, sabr, sabr_implied_vol
+from optionview.models import (
+    black_scholes,
+    binomial_tree,
+    monte_carlo,
+    implied_volatility,
+    heston,
+    sabr,
+    sabr_implied_vol,
+    calibrate_sabr,
+    SABRCalibration,
+)
 from optionview.greeks import compute_greeks
 from optionview.fetcher import (
     fetch_option_chain,
@@ -39,6 +49,8 @@ __all__ = [
     "heston",
     "sabr",
     "sabr_implied_vol",
+    "calibrate_sabr",
+    "SABRCalibration",
     "compute_greeks",
     "fetch_option_chain",
     "fetch_spot_price",
