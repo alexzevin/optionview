@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "optionview"
-version = "0.1.5"
+version = "0.1.8"
 description = "Compare option pricing models against live market data using free APIs"
 readme = "README.md"
 license = {text = "MIT"}
