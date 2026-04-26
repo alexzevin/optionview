@@ -10,6 +10,7 @@ Covers:
 - Volatility surface construction and structural invariants
 - ComparisonReport filtering and aggregate statistics
 - NaN-safe conversion helpers in fetcher.py
+- SABR calibration: input validation, structural invariants, and round-trip parameter recovery
 
 Design note: tests that involve Monte Carlo use a fixed seed and a generous
 absolute tolerance. The MC error bound reflects the statistical nature of the
@@ -2556,3 +2557,237 @@ class TestSABRPricer:
                 f"Expected higher nu to increase {option_type} price: "
                 f"nu=0.1 gives {prices_low_nu[i]:.4f}, nu=0.6 gives {prices_high_nu[i]:.4f}"
             )
+
+
+# ---------------------------------------------------------------------------
+# SABR calibration
+# ---------------------------------------------------------------------------
+from optionview.models import calibrate_sabr, SABRCalibration
+
+
+class TestSABRCalibration:
+    """Tests for calibrate_sabr and SABRCalibration.
+
+    Covers input validation, structural invariants on the returned dataclass,
+    and round-trip parameter recovery from exact SABR-generated implied vol
+    quotes. The round-trip tests exploit the fact that when market quotes are
+    produced by the SABR formula with known parameters and no noise, the
+    optimizer should converge to a near-zero RMSE solution.
+    """
+
+    _FORWARD: float = 100.0
+    _T: float = 0.5
+    _ALPHA: float = 0.25
+    _BETA: float = 1.0
+    _RHO: float = -0.3
+    _NU: float = 0.4
+    _STRIKES: list[float] = [80.0, 85.0, 90.0, 95.0, 100.0, 105.0, 110.0, 115.0, 120.0]
+
+    @classmethod
+    def _make_quotes(
+        cls,
+        forward: float | None = None,
+        t: float | None = None,
+        alpha: float | None = None,
+        beta: float | None = None,
+        rho: float | None = None,
+        nu: float | None = None,
+        strikes: list[float] | None = None,
+    ) -> list[tuple[float, float, float, float]]:
+        """Build (forward, strike, expiry_years, iv) tuples from exact SABR IVs."""
+        fwd = forward if forward is not None else cls._FORWARD
+        t_ = t if t is not None else cls._T
+        a = alpha if alpha is not None else cls._ALPHA
+        b = beta if beta is not None else cls._BETA
+        r = rho if rho is not None else cls._RHO
+        n = nu if nu is not None else cls._NU
+        ks = strikes if strikes is not None else cls._STRIKES
+        return [
+            (fwd, k, t_, sabr_implied_vol(fwd, k, t_, a, b, r, n))
+            for k in ks
+        ]
+
+    # ------------------------------------------------------------------
+    # Input validation
+    # ------------------------------------------------------------------
+
+    def test_empty_quotes_raises_value_error(self) -> None:
+        """An empty market_quotes list raises ValueError."""
+        with pytest.raises(ValueError, match="non-empty"):
+            calibrate_sabr([], beta=1.0)
+
+    def test_invalid_beta_below_zero_raises(self) -> None:
+        """beta < 0 is outside [0, 1] and raises ValueError."""
+        with pytest.raises(ValueError, match="beta"):
+            calibrate_sabr(self._make_quotes(), beta=-0.1)
+
+    def test_invalid_beta_above_one_raises(self) -> None:
+        """beta > 1 is outside [0, 1] and raises ValueError."""
+        with pytest.raises(ValueError, match="beta"):
+            calibrate_sabr(self._make_quotes(), beta=1.01)
+
+    def test_invalid_forward_in_quote_raises(self) -> None:
+        """A quote with forward <= 0 raises ValueError."""
+        with pytest.raises(ValueError):
+            calibrate_sabr([(0.0, 100.0, 0.5, 0.25)], beta=1.0)
+
+    def test_invalid_strike_in_quote_raises(self) -> None:
+        """A quote with strike <= 0 raises ValueError."""
+        with pytest.raises(ValueError):
+            calibrate_sabr([(100.0, -1.0, 0.5, 0.25)], beta=1.0)
+
+    def test_invalid_expiry_in_quote_raises(self) -> None:
+        """A quote with expiry_years <= 0 raises ValueError."""
+        with pytest.raises(ValueError):
+            calibrate_sabr([(100.0, 100.0, 0.0, 0.25)], beta=1.0)
+
+    def test_invalid_iv_in_quote_raises(self) -> None:
+        """A quote with market_iv <= 0 raises ValueError."""
+        with pytest.raises(ValueError):
+            calibrate_sabr([(100.0, 100.0, 0.5, 0.0)], beta=1.0)
+
+    # ------------------------------------------------------------------
+    # Structural invariants
+    # ------------------------------------------------------------------
+
+    def test_return_type_is_sabr_calibration(self) -> None:
+        """calibrate_sabr returns a SABRCalibration dataclass instance."""
+        result = calibrate_sabr(self._make_quotes(), beta=1.0)
+        assert isinstance(result, SABRCalibration)
+
+    def test_beta_is_fixed_in_result(self) -> None:
+        """The fitted beta always matches the input beta unchanged by the optimizer."""
+        for b in [0.0, 0.5, 1.0]:
+            quotes = self._make_quotes(beta=b)
+            fit = calibrate_sabr(quotes, beta=b)
+            assert fit.beta == b, f"Expected beta={b}, got {fit.beta}"
+
+    def test_n_points_matches_quote_count(self) -> None:
+        """fit.n_points equals the length of market_quotes."""
+        quotes = self._make_quotes()
+        fit = calibrate_sabr(quotes, beta=1.0)
+        assert fit.n_points == len(quotes)
+
+    def test_rmse_is_nonneg(self) -> None:
+        """RMSE is always non-negative."""
+        fit = calibrate_sabr(self._make_quotes(), beta=1.0)
+        assert fit.rmse >= 0.0
+
+    def test_max_abs_error_is_nonneg(self) -> None:
+        """max_abs_error is always non-negative."""
+        fit = calibrate_sabr(self._make_quotes(), beta=1.0)
+        assert fit.max_abs_error >= 0.0
+
+    def test_max_abs_error_ge_rmse(self) -> None:
+        """max_abs_error is always >= RMSE: the maximum dominates the average."""
+        fit = calibrate_sabr(self._make_quotes(), beta=1.0)
+        assert fit.max_abs_error >= fit.rmse - 1e-12
+
+    def test_calibrated_alpha_positive(self) -> None:
+        """Fitted alpha is strictly positive, enforced by optimizer bounds."""
+        fit = calibrate_sabr(self._make_quotes(), beta=1.0)
+        assert fit.alpha > 0.0
+
+    def test_calibrated_rho_in_unit_interval(self) -> None:
+        """Fitted rho lies strictly inside (-1, 1)."""
+        fit = calibrate_sabr(self._make_quotes(), beta=1.0)
+        assert -1.0 < fit.rho < 1.0
+
+    def test_calibrated_nu_nonneg(self) -> None:
+        """Fitted nu is non-negative, enforced by optimizer bounds."""
+        fit = calibrate_sabr(self._make_quotes(), beta=1.0)
+        assert fit.nu >= 0.0
+
+    # ------------------------------------------------------------------
+    # Round-trip accuracy
+    # ------------------------------------------------------------------
+
+    def test_round_trip_rmse_near_zero(self) -> None:
+        """Calibrating to exact SABR IVs recovers near-zero RMSE.
+
+        When market quotes are produced by the SABR formula with no noise,
+        the optimizer has a smooth, zero-residual global minimum. RMSE below
+        1e-4 (0.01 vol point = 1 bp) verifies that the objective function,
+        optimizer wiring, and parameter bounds are all correct.
+        """
+        quotes = self._make_quotes()
+        fit = calibrate_sabr(quotes, beta=self._BETA)
+        assert fit.rmse < 1e-4, (
+            f"Expected RMSE < 1e-4 on exact SABR quotes, got {fit.rmse:.6f}. "
+            f"Check that sabr_implied_vol and the objective function are consistent."
+        )
+
+    def test_round_trip_max_error_near_zero(self) -> None:
+        """Max single-strike error is small when calibrating to exact SABR IVs."""
+        quotes = self._make_quotes()
+        fit = calibrate_sabr(quotes, beta=self._BETA)
+        assert fit.max_abs_error < 1e-3, (
+            f"Expected max_abs_error < 1e-3 on exact SABR quotes, "
+            f"got {fit.max_abs_error:.6f}"
+        )
+
+    def test_negative_rho_recovered_from_downward_skew(self) -> None:
+        """A strongly downward-sloping smile calibrates to a negative fitted rho.
+
+        With rho=-0.6 the SABR smile tilts sharply downward: OTM puts carry
+        higher IV than equidistant OTM calls. The optimizer should recover a
+        negative rho regardless of initialization when the skew signal is this
+        strong across a wide strike range.
+        """
+        quotes = self._make_quotes(rho=-0.6, nu=0.5)
+        fit = calibrate_sabr(quotes, beta=1.0)
+        assert fit.rho < 0.0, (
+            f"Expected negative rho for downward-skewed input, got rho={fit.rho:.4f}"
+        )
+
+    def test_positive_rho_recovered_from_upward_skew(self) -> None:
+        """A strongly upward-sloping smile calibrates to a positive fitted rho."""
+        quotes = self._make_quotes(rho=0.4, nu=0.5)
+        fit = calibrate_sabr(quotes, beta=1.0)
+        assert fit.rho > 0.0, (
+            f"Expected positive rho for upward-skewed input, got rho={fit.rho:.4f}"
+        )
+
+    def test_minimal_three_strike_slice_is_valid(self) -> None:
+        """Three strikes are the minimum for a meaningful 3-parameter fit.
+
+        With exactly three quotes the system is exactly determined (one quote
+        per free parameter: alpha, rho, nu). calibrate_sabr should accept this
+        input and return a valid SABRCalibration with n_points == 3.
+        """
+        quotes = self._make_quotes(strikes=[90.0, 100.0, 110.0])
+        fit = calibrate_sabr(quotes, beta=1.0)
+        assert fit.n_points == 3
+        assert fit.rmse >= 0.0
+        assert isinstance(fit, SABRCalibration)
+
+    def test_normal_backbone_beta_zero_round_trip(self) -> None:
+        """calibrate_sabr converges for the normal backbone (beta=0).
+
+        The beta=0 case is used for interest rate swaptions and near-zero
+        rate environments. The SABR formula has a distinct CEV backbone for
+        beta=0, so this test confirms that the objective function and
+        optimizer bounds handle the degenerate fk_mid term correctly.
+        """
+        quotes = self._make_quotes(alpha=0.15, beta=0.0, rho=-0.2, nu=0.3)
+        fit = calibrate_sabr(quotes, beta=0.0)
+        assert fit.beta == 0.0
+        assert fit.rmse < 1e-3, (
+            f"Expected low RMSE for beta=0 round-trip, got {fit.rmse:.6f}"
+        )
+
+    def test_higher_nu_input_yields_higher_fitted_nu(self) -> None:
+        """A wider smile (higher input nu) calibrates to a larger fitted nu.
+
+        nu controls smile curvature: larger nu widens the wings relative to
+        ATM. Comparing two calibrations on the same forward and rho, the one
+        generated with nu=0.8 should recover a higher fitted nu than the one
+        generated with nu=0.2, confirming the optimizer correctly identifies
+        the curvature parameter.
+        """
+        fit_low = calibrate_sabr(self._make_quotes(nu=0.2), beta=1.0)
+        fit_high = calibrate_sabr(self._make_quotes(nu=0.8), beta=1.0)
+        assert fit_high.nu > fit_low.nu, (
+            f"Expected fitted nu to increase with input nu: "
+            f"nu=0.2 -> {fit_low.nu:.4f}, nu=0.8 -> {fit_high.nu:.4f}"
+        )
