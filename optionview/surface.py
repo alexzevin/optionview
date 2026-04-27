@@ -94,6 +94,54 @@ class SmileSummary:
     iv_range: tuple[float, float]
 
 
+
+
+@dataclass(frozen=True)
+class ForwardVolPoint:
+    """Implied forward volatility between two adjacent expiry slices.
+
+    Derives the forward implied variance between two consecutive expirations
+    from their ATM volatilities:
+
+        var_fwd(T1, T2) = (sigma_far^2 * T_far - sigma_near^2 * T_near)
+                          / (T_far - T_near)
+
+    This is the unique constant variance that, compounded with the near-expiry
+    variance, reproduces the far-expiry total variance. It is the vol-surface
+    analog of the instantaneous forward rate in interest rate term structures.
+
+    A non-negative forward variance is a necessary condition for the ATM term
+    structure to be free of calendar spread arbitrage. If var_fwd < 0, a
+    static arbitrage exists: buying the near-expiry straddle and selling the
+    far-expiry straddle at the same strike locks in a risk-free profit
+    regardless of the realized path.
+
+    Attributes:
+        near_expiry: Earlier expiration date.
+        far_expiry: Later expiration date.
+        near_atm_vol: ATM implied vol at near_expiry, as a decimal.
+        far_atm_vol: ATM implied vol at far_expiry, as a decimal.
+        near_years: Fractional years to near_expiry from the surface build date.
+        far_years: Fractional years to far_expiry from the surface build date.
+        forward_variance: Raw implied forward variance for the period
+            [near_years, far_years]. May be negative when the term structure
+            is inverted strongly enough to violate no-arbitrage.
+        forward_vol: Square root of forward_variance, as a decimal.
+            None if forward_variance is non-positive (arbitrage violation or
+            degenerate case).
+        is_arbitrage_free: True if forward_variance is strictly positive.
+    """
+
+    near_expiry: date
+    far_expiry: date
+    near_atm_vol: float
+    far_atm_vol: float
+    near_years: float
+    far_years: float
+    forward_variance: float
+    forward_vol: float | None
+    is_arbitrage_free: bool
+
 @dataclass
 class VolatilitySurface:
     """Implied volatility surface organized by expiration and log-moneyness.
@@ -282,6 +330,80 @@ class VolatilitySurface:
                 )
             )
         return summaries
+
+    def forward_vol_curve(self) -> list[ForwardVolPoint]:
+        """Compute implied forward volatilities across adjacent expiry pairs.
+
+        Extracts ATM implied vol at each expiry using atm_term_structure()
+        and derives the forward variance between every consecutive pair of
+        expirations:
+
+            var_fwd(T1, T2) = (sigma2^2 * T2 - sigma1^2 * T1) / (T2 - T1)
+
+        The forward vol for each interval is sqrt(var_fwd) when var_fwd > 0.
+        When var_fwd is zero or negative, forward_vol is set to None and
+        is_arbitrage_free is False, indicating a calendar spread arbitrage
+        in the observed ATM term structure.
+
+        A common source of negative forward variance in practice is stale
+        market data: if the near expiry is quoted with an artificially high
+        IV but the far expiry reflects a normal level, the inferred forward
+        variance can go negative. Filtering with min_open_interest during
+        surface construction reduces this noise.
+
+        The method reads expiry_years directly from the surface points rather
+        than recomputing from today's date, so results are consistent with
+        the surface's built_at timestamp.
+
+        Returns:
+            List of ForwardVolPoint objects for each adjacent expiry pair,
+            ordered chronologically by near_expiry. Returns an empty list
+            when fewer than two expirations are present on the surface.
+        """
+        atm = self.atm_term_structure()
+        exps = sorted(atm.keys())
+        if len(exps) < 2:
+            return []
+
+        exp_to_years: dict[date, float] = {}
+        for pt in self.points:
+            if pt.expiration not in exp_to_years:
+                exp_to_years[pt.expiration] = pt.expiry_years
+
+        result: list[ForwardVolPoint] = []
+        for i in range(len(exps) - 1):
+            near_exp = exps[i]
+            far_exp = exps[i + 1]
+
+            sigma_near = atm[near_exp]
+            sigma_far = atm[far_exp]
+            t_near = exp_to_years[near_exp]
+            t_far = exp_to_years[far_exp]
+
+            dt = t_far - t_near
+            if dt <= 0.0:
+                continue
+
+            var_fwd = (sigma_far ** 2 * t_far - sigma_near ** 2 * t_near) / dt
+            is_arb_free = var_fwd > 0.0
+            fwd_vol: float | None = math.sqrt(var_fwd) if is_arb_free else None
+
+            result.append(
+                ForwardVolPoint(
+                    near_expiry=near_exp,
+                    far_expiry=far_exp,
+                    near_atm_vol=sigma_near,
+                    far_atm_vol=sigma_far,
+                    near_years=t_near,
+                    far_years=t_far,
+                    forward_variance=var_fwd,
+                    forward_vol=fwd_vol,
+                    is_arbitrage_free=is_arb_free,
+                )
+            )
+
+        return result
+
 
 
 def _ols_slope(xs: Sequence[float], ys: Sequence[float]) -> float:
