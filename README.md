@@ -7,7 +7,7 @@ A Python toolkit for comparing option pricing models against real-time market da
 - **Multiple Pricing Models**: Black-Scholes, Binomial Tree, Monte Carlo simulation, Heston stochastic volatility, and SABR (Hagan et al. 2002)
 - **Live Market Data**: Fetches real-time option chains from Yahoo Finance (no API key required)
 - **Model Comparison**: Side-by-side comparison of theoretical vs. market prices
-- **Volatility Surface Construction**: Builds an implied volatility surface from multi-expiry option chains, with per-expiry smile analysis (OLS slope and IV range), ATM term structure extraction, log-moneyness normalized IVPoints, and piecewise-linear IV interpolation across strikes
+- **Volatility Surface Construction**: Builds an implied volatility surface from multi-expiry option chains, with per-expiry smile analysis (OLS slope and IV range), ATM term structure extraction, log-moneyness normalized IVPoints, piecewise-linear IV interpolation across strikes, and implied forward volatility extraction with calendar spread arbitrage detection
 - **Greeks Calculation**: Full analytical Greeks including Delta, Gamma, Theta, Vega, Rho, Epsilon (dividend sensitivity), Vanna, and Charm
 - **Implied Volatility Solver**: Newton-Raphson IV solver with configurable tolerance
 - **Portfolio Greeks Aggregation**: Aggregate Greeks across a collection of long and short option positions, with per-position and net portfolio risk
@@ -208,6 +208,73 @@ Mixing calls and puts at the same strikes is handled correctly since
 `interpolate_iv` raises `ValueError` if the expiration is not on the surface
 or if fewer than two points are present for that expiry (use
 `atm_term_structure()` for single-point expirations).
+
+## Forward Volatility Curve
+
+`forward_vol_curve()` extracts the implied forward volatility between each pair of adjacent
+expirations on the surface. The forward variance for the interval [T1, T2] is derived from
+the ATM implied vols at the two expiries:
+
+    var_fwd(T1, T2) = (sigma_far^2 * T_far - sigma_near^2 * T_near) / (T_far - T_near)
+
+This is the unique constant variance that, when compounded with the near-expiry variance,
+reproduces the far-expiry total variance. It is the volatility analog of the instantaneous
+forward rate in interest rate term structures. A rising ATM term structure (far vol above
+near vol) implies a forward vol above the far ATM level, because the far slice must
+"account for" both the near period and the steeper forward period together.
+
+A negative forward variance indicates a calendar spread arbitrage: buying the near-expiry
+straddle and selling the far-expiry straddle at the same strike would produce a risk-free
+profit regardless of the realized path. In practice this usually reflects stale quotes on a
+near expiry rather than a genuine market dislocation. Building the surface with a
+`min_open_interest` filter reduces the frequency of these cases.
+
+```python
+from optionview.fetcher import fetch_option_chain, fetch_spot_price, list_expirations
+from optionview.surface import build_surface
+
+ticker = "SPY"
+expirations = list_expirations(ticker)[:5]  # five nearest expiries
+
+all_records = []
+for exp in expirations:
+    all_records.extend(fetch_option_chain(ticker, expiration=exp))
+
+spot = fetch_spot_price(ticker)
+rate = 0.05
+div_yield = 0.013
+
+surface = build_surface(all_records, spot, rate, div_yield, min_open_interest=50)
+
+for pt in surface.forward_vol_curve():
+    arb_flag = "" if pt.is_arbitrage_free else "  [calendar arb]"
+    fwd_str = f"{pt.forward_vol:.1%}" if pt.forward_vol is not None else "n/a"
+    print(
+        f"  {pt.near_expiry} -> {pt.far_expiry}: "
+        f"near={pt.near_atm_vol:.1%}  far={pt.far_atm_vol:.1%}  "
+        f"fwd={fwd_str}{arb_flag}"
+    )
+```
+
+`forward_vol_curve()` returns one `ForwardVolPoint` per adjacent expiry pair. Each object
+carries the raw `forward_variance` alongside the derived `forward_vol` (None when the
+variance is non-positive) and an explicit `is_arbitrage_free` flag. Because the flag and
+`forward_vol` are always consistent, callers can filter arbitrage-violating intervals with
+a single attribute check rather than recomputing variance.
+
+```python
+# Count intervals that violate calendar no-arbitrage
+violations = [pt for pt in surface.forward_vol_curve() if not pt.is_arbitrage_free]
+print(f"{len(violations)} calendar arb violation(s) detected")
+for pt in violations:
+    print(
+        f"  {pt.near_expiry} -> {pt.far_expiry}: "
+        f"forward_variance={pt.forward_variance:.6f} (near={pt.near_atm_vol:.1%}, "
+        f"far={pt.far_atm_vol:.1%})"
+    )
+```
+
+The method returns an empty list when fewer than two expirations are present on the surface.
 
 ## Heston Stochastic Volatility
 
