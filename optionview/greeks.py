@@ -14,6 +14,13 @@ Second-order Greeks included:
     called "delta decay." Useful when managing overnight or weekend
     delta exposure without rehedging.
 
+  Volga  (d^2V / d_sigma^2): second-order vol sensitivity, also called
+    vomma. Measures how vega itself changes as volatility moves. Positive
+    for OTM and ITM options (vega grows as vol approaches the strike),
+    near-zero and slightly negative for deep ATM options. Used in the
+    Scenario P&L expansion as the 0.5 * volga * (d_sigma)^2 correction
+    term, which becomes material for vol moves larger than ~2 vol points.
+
 All Greeks default to dividend_yield=0.0, preserving backward compatibility
 with code that does not pass a yield.
 """
@@ -77,6 +84,11 @@ def compute_greeks(
                when volatility moves. Key for skew-sensitive hedging.
       charm  - dDelta/dt. Rate of delta decay over one calendar day. Expressed
                per day so that overnight exposure can be estimated directly.
+      volga  - d^2V/dSigma^2 = dVega/dSigma. Second-order vol sensitivity
+               (vomma). Stored in the same (1% vol point)^2 convention as
+               vega, so that scenario_pnl = 0.5 * volga * (dvol/0.01)^2.
+               Positive for OTM/ITM options, near-zero for deep ATM.
+               Same formula for calls and puts.
 
     Args:
         spot: Current price of the underlying asset.
@@ -90,7 +102,7 @@ def compute_greeks(
 
     Returns:
         Dictionary with keys: delta, gamma, theta, vega, rho, epsilon,
-        vanna, charm.
+        vanna, charm, volga.
     """
     d1, d2 = _bs_d1_d2(spot, strike, rate, volatility, expiry_years, dividend_yield)
     sqrt_t = np.sqrt(expiry_years)
@@ -107,6 +119,19 @@ def compute_greeks(
     # Vanna: d^2V/(dS d_sigma) = -exp(-q*T) * N'(d1) * d2 / sigma
     # Same sign/magnitude for calls and puts.
     vanna = float(-discount_q * pdf_d1 * d2 / volatility)
+
+    # Volga (vomma): d^2V/d_sigma^2 = S*exp(-q*T)*N'(d1)*sqrt(T)*d1*d2/sigma
+    # Derivation: differentiate vega_standard = S*exp(-q*T)*N'(d1)*sqrt(T) w.r.t. sigma.
+    # Using dN'(d1)/d_sigma = -d1*N'(d1)*dd1/d_sigma and dd1/d_sigma = -d2/sigma:
+    #   d^2V/d_sigma^2 = S*exp(-q*T)*sqrt(T)*(-d1*N'(d1))*(-d2/sigma)
+    #                  = S*exp(-q*T)*sqrt(T)*d1*d2*N'(d1)/sigma
+    # Stored scaled by 0.0001 = (0.01)^2 so that the scenario expansion term is
+    #   volga_pnl = 0.5 * volga * (dvol/0.01)^2
+    # which parallels gamma_pnl = 0.5 * gamma * ds^2.
+    # Positive when d1 and d2 share the same sign (deep OTM or deep ITM);
+    # slightly negative for near-ATM options where d1 > 0 and d2 < 0.
+    # Same formula for calls and puts.
+    volga = float(spot * discount_q * pdf_d1 * sqrt_t * d1 * d2 / volatility * 0.0001)
 
     if option_type == "call":
         delta = float(discount_q * norm.cdf(d1))
@@ -161,4 +186,5 @@ def compute_greeks(
         "epsilon": epsilon,
         "vanna": vanna,
         "charm": charm_daily,
+        "volga": volga,
     }
