@@ -8,10 +8,10 @@ A Python toolkit for comparing option pricing models against real-time market da
 - **Live Market Data**: Fetches real-time option chains from Yahoo Finance (no API key required)
 - **Model Comparison**: Side-by-side comparison of theoretical vs. market prices
 - **Volatility Surface Construction**: Builds an implied volatility surface from multi-expiry option chains, with per-expiry smile analysis (OLS slope and IV range), ATM term structure extraction, log-moneyness normalized IVPoints, piecewise-linear IV interpolation across strikes, and implied forward volatility extraction with calendar spread arbitrage detection
-- **Greeks Calculation**: Full analytical Greeks including Delta, Gamma, Theta, Vega, Rho, Epsilon (dividend sensitivity), Vanna, and Charm
+- **Greeks Calculation**: Full analytical Greeks including Delta, Gamma, Theta, Vega, Rho, Epsilon (dividend sensitivity), Vanna, Charm, and Volga (vomma)
 - **Implied Volatility Solver**: Newton-Raphson IV solver with configurable tolerance
 - **Portfolio Greeks Aggregation**: Aggregate Greeks across a collection of long and short option positions, with per-position and net portfolio risk
-- **Scenario P&L**: Estimate portfolio P&L for a simultaneous move in spot, implied vol, and time using a second-order Taylor expansion (delta, gamma, vega, theta, vanna, charm), useful for stress testing and what-if analysis without a full reprice
+- **Scenario P&L**: Estimate portfolio P&L for a simultaneous move in spot, implied vol, and time using a second-order Taylor expansion (delta, gamma, vega, theta, vanna, charm, volga), useful for stress testing and what-if analysis without a full reprice
 - **Clean API**: Simple, composable functions for scripting and analysis
 
 ## Installation
@@ -565,16 +565,19 @@ when all positions share the same underlying.
 
 `scenario_pnl` applies a second-order Taylor expansion to estimate how a portfolio
 gains or loses under a simultaneous move in spot (`ds`), implied volatility (`dvol`),
-and calendar time (`dt_days`). It decomposes total P&L into six named components:
+and calendar time (`dt_days`). It decomposes total P&L into seven named components:
 
 ```
 P&L = delta*ds + 0.5*gamma*ds^2 + vega*(dvol/0.01) + theta*dt_days
-      + vanna*ds*dvol + charm*ds*dt_days
+      + vanna*ds*dvol + charm*ds*dt_days + 0.5*volga*(dvol/0.01)^2
 ```
 
 This is faster than a full reprice and gives a clear attribution across Greek factors.
-Cross-sensitivity terms (vanna and charm) are small for modest moves but become
-material when spot and vol shift together, which is common around macro events.
+Cross-sensitivity terms (vanna, charm) are small for modest moves but become material
+when spot and vol shift together, which is common around macro events. The volga term
+captures the curvature of option value with respect to vol: it is positive for OTM and
+ITM positions (which gain vega as vol moves toward the money) and negligible for small
+vol moves but meaningful for shifts of 3 or more vol points.
 
 ```python
 from optionview.portfolio import Position, aggregate_greeks, scenario_pnl
@@ -597,13 +600,16 @@ print(f"Vega P&L:   {pnl.vega_pnl:+.2f}")    # vol compression hurts long vol bo
 print(f"Theta P&L:  {pnl.theta_pnl:+.2f}")   # time decay cost
 print(f"Vanna P&L:  {pnl.vanna_pnl:+.2f}")   # spot-vol cross term
 print(f"Charm P&L:  {pnl.charm_pnl:+.2f}")   # spot-time cross term
+print(f"Volga P&L:  {pnl.volga_pnl:+.2f}")   # second-order vol curvature
 print(f"Total P&L:  {pnl.total_pnl:+.2f}")
 ```
 
 For large moves (more than roughly 5% of spot) or horizons beyond 30 days, the
 expansion accuracy degrades and a full reprice using the pricing models is more
-reliable. The expansion does not capture vol-of-vol (volga) or higher-order spot
-terms, so it works best for short-horizon stress scenarios.
+reliable. The expansion does not capture higher-order spot terms (speed, color) or
+carry effects, so it works best for short-horizon stress scenarios. The included
+volga term improves vol-move accuracy relative to a pure first-order vega estimate,
+particularly for OTM positions experiencing vol expansion.
 
 ## Project Structure
 
