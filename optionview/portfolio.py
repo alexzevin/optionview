@@ -40,7 +40,7 @@ from optionview.models import OptionType
 
 
 _GREEK_KEYS: tuple[str, ...] = (
-    "delta", "gamma", "theta", "vega", "rho", "epsilon", "vanna", "charm"
+    "delta", "gamma", "theta", "vega", "rho", "epsilon", "vanna", "charm", "volga"
 )
 
 
@@ -153,7 +153,13 @@ class ScenarioPnL:
         charm_pnl: Cross-sensitivity P&L: charm * ds * dt_days. Measures
             the additional spot sensitivity accumulated as delta drifts over
             dt_days calendar days, applied to the spot move ds.
-        total_pnl: Arithmetic sum of all six components.
+        volga_pnl: Second-order vol P&L: 0.5 * volga * (dvol/0.01)^2.
+            Captures the curvature of option value with respect to vol.
+            Positive for OTM/ITM books (which gain vega as vol moves toward
+            the money), slightly negative for deep ATM books. Negligible for
+            small vol moves (<2 vol points) but material for larger shifts
+            such as those that occur around macro events or earnings.
+        total_pnl: Arithmetic sum of all seven components.
         ds: Spot shift used (same units as Position.spot).
         dvol: Implied vol shift in decimal units (e.g. 0.01 = +1 vol point).
         dt_days: Calendar days elapsed (non-negative).
@@ -165,6 +171,7 @@ class ScenarioPnL:
     theta_pnl: float
     vanna_pnl: float
     charm_pnl: float
+    volga_pnl: float
     total_pnl: float
     ds: float
     dvol: float
@@ -180,7 +187,7 @@ def scenario_pnl(
     """Estimate portfolio P&L under a simultaneous market scenario.
 
     Applies a second-order Taylor expansion using the net Greeks from a
-    PortfolioRisk object. The expansion decomposes P&L into six named
+    PortfolioRisk object. The expansion decomposes P&L into seven named
     components, each attributable to a specific Greek:
 
         P&L = delta*ds
@@ -189,6 +196,7 @@ def scenario_pnl(
             + theta*dt_days
             + vanna*ds*dvol
             + charm*ds*dt_days
+            + 0.5*volga*(dvol/0.01)^2
 
     Greek unit conventions (inherited from compute_greeks):
       - delta: price change per $1 spot move (dimensionless fraction).
@@ -198,11 +206,14 @@ def scenario_pnl(
       - theta: price change per calendar day (negative for long options).
       - vanna: delta change per unit sigma (decimal). Multiplied by ds*dvol.
       - charm: delta change per calendar day. Multiplied by ds*dt_days.
+      - volga: stored as d^2V/d_sigma^2 scaled by 0.0001, so the term is
+        0.5 * volga * (dvol/0.01)^2, analogous to gamma_pnl = 0.5*gamma*ds^2.
 
-    The expansion is accurate to first order in dvol and dt_days and to
-    second order in ds. It does not account for vol-of-vol (volga),
-    higher-order spot terms, or carry effects. For large moves (ds/spot > 5%)
-    or long horizons (dt_days > 30), a full reprice is more reliable.
+    The expansion is accurate to second order in both ds and dvol, and to
+    first order in dt_days. It does not account for higher-order spot terms
+    (speed, color) or carry effects. For large moves (ds/spot > 5%) or long
+    horizons (dt_days > 30), a full reprice is more reliable. The volga term
+    significantly improves accuracy for vol moves larger than ~2 vol points.
 
     Args:
         risk: Portfolio risk from aggregate_greeks, providing net Greeks.
@@ -250,8 +261,11 @@ def scenario_pnl(
     theta_pnl = g["theta"] * dt_days
     vanna_pnl = g["vanna"] * ds * dvol
     charm_pnl = g["charm"] * ds * dt_days
+    # volga stored scaled by 0.0001 = (0.01)^2; (dvol/0.01)^2 recovers the
+    # correct decimal-vol units, paralleling gamma_pnl = 0.5*gamma*ds^2.
+    volga_pnl = 0.5 * g["volga"] * (dvol / 0.01) ** 2
 
-    total = delta_pnl + gamma_pnl + vega_pnl + theta_pnl + vanna_pnl + charm_pnl
+    total = delta_pnl + gamma_pnl + vega_pnl + theta_pnl + vanna_pnl + charm_pnl + volga_pnl
 
     return ScenarioPnL(
         delta_pnl=delta_pnl,
@@ -260,6 +274,7 @@ def scenario_pnl(
         theta_pnl=theta_pnl,
         vanna_pnl=vanna_pnl,
         charm_pnl=charm_pnl,
+        volga_pnl=volga_pnl,
         total_pnl=total,
         ds=ds,
         dvol=dvol,
