@@ -36,10 +36,12 @@ from optionview.surface import (
 from optionview.portfolio import (
     aggregate_greeks,
     scenario_pnl,
+    reprice_scenario,
     Position,
     PositionRisk,
     PortfolioRisk,
     ScenarioPnL,
+    RepricedPnL,
 )
 
 __all__ = [
@@ -68,8 +70,10 @@ __all__ = [
     "ForwardVolPoint",
     "aggregate_greeks",
     "scenario_pnl",
+    "reprice_scenario",
     "Position",
     "PositionRisk",
     "PortfolioRisk",
     "ScenarioPnL",
+    "RepricedPnL",
 ]
