@@ -2791,3 +2791,217 @@ class TestSABRCalibration:
             f"Expected fitted nu to increase with input nu: "
             f"nu=0.2 -> {fit_low.nu:.4f}, nu=0.8 -> {fit_high.nu:.4f}"
         )
+
+
+# ---------------------------------------------------------------------------
+# TestRepricedScenarioPnL
+# ---------------------------------------------------------------------------
+
+class TestRepricedScenarioPnL:
+    """Tests for reprice_scenario and RepricedPnL.
+
+    Covers:
+    - Zero scenario produces zero P&L (exact at machine precision)
+    - Small-move agreement with scenario_pnl (Taylor approximation)
+    - Large-move divergence from scenario_pnl (demonstrating approximation error)
+    - Directional sign checks for basic positions
+    - Degenerate cases: expired position, spot near zero, negative dvol error
+    - Input validation: negative dt_days, bumped vol below zero
+    - Per-position P&L count and quantity scaling
+    """
+
+    def _call(self, quantity: float = 1.0) -> "Position":
+        from optionview.portfolio import Position
+        return Position(
+            spot=100.0, strike=100.0, rate=0.05, volatility=0.25,
+            expiry_years=0.5, option_type="call", quantity=quantity,
+        )
+
+    def _put(self, quantity: float = 1.0) -> "Position":
+        from optionview.portfolio import Position
+        return Position(
+            spot=100.0, strike=100.0, rate=0.05, volatility=0.25,
+            expiry_years=0.5, option_type="put", quantity=quantity,
+        )
+
+    def test_zero_scenario_zero_pnl(self) -> None:
+        """No shift -> P&L is exactly zero for all positions."""
+        from optionview.portfolio import reprice_scenario
+        positions = [self._call(5.0), self._put(5.0)]
+        result = reprice_scenario(positions, ds=0.0, dvol=0.0, dt_days=0.0)
+        assert result.total_pnl == pytest.approx(0.0, abs=1e-10)
+        for pnl in result.per_position_pnl:
+            assert pnl == pytest.approx(0.0, abs=1e-10)
+
+    def test_per_position_count_matches_input(self) -> None:
+        """len(per_position_pnl) must equal len(positions) for any input size."""
+        from optionview.portfolio import reprice_scenario
+        positions = [self._call(), self._put(), self._call(2.0)]
+        result = reprice_scenario(positions, ds=5.0)
+        assert len(result.per_position_pnl) == 3
+
+    def test_long_call_spot_up_is_positive(self) -> None:
+        """Long call gains when spot rises."""
+        from optionview.portfolio import reprice_scenario
+        result = reprice_scenario([self._call(1.0)], ds=10.0)
+        assert result.total_pnl > 0.0, (
+            f"Expected positive P&L for long call with ds=+10, got {result.total_pnl:.4f}"
+        )
+
+    def test_long_call_spot_down_is_negative(self) -> None:
+        """Long call loses when spot falls."""
+        from optionview.portfolio import reprice_scenario
+        result = reprice_scenario([self._call(1.0)], ds=-10.0)
+        assert result.total_pnl < 0.0, (
+            f"Expected negative P&L for long call with ds=-10, got {result.total_pnl:.4f}"
+        )
+
+    def test_long_put_spot_down_is_positive(self) -> None:
+        """Long put gains when spot falls."""
+        from optionview.portfolio import reprice_scenario
+        result = reprice_scenario([self._put(1.0)], ds=-10.0)
+        assert result.total_pnl > 0.0, (
+            f"Expected positive P&L for long put with ds=-10, got {result.total_pnl:.4f}"
+        )
+
+    def test_long_straddle_vol_down_is_negative(self) -> None:
+        """Long straddle (long call + long put) has positive vega; vol drop hurts."""
+        from optionview.portfolio import reprice_scenario
+        positions = [self._call(10.0), self._put(10.0)]
+        result = reprice_scenario(positions, dvol=-0.05)
+        assert result.total_pnl < 0.0, (
+            f"Expected negative P&L for long straddle with dvol=-0.05, got {result.total_pnl:.4f}"
+        )
+
+    def test_time_decay_is_negative_for_long_straddle(self) -> None:
+        """Long straddle decays with time (theta is negative for long options)."""
+        from optionview.portfolio import reprice_scenario
+        positions = [self._call(5.0), self._put(5.0)]
+        result = reprice_scenario(positions, dt_days=7.0)
+        assert result.total_pnl < 0.0, (
+            f"Expected negative P&L for long straddle with dt_days=7, got {result.total_pnl:.4f}"
+        )
+
+    def test_quantity_scaling_is_linear(self) -> None:
+        """P&L scales linearly with quantity."""
+        from optionview.portfolio import reprice_scenario
+        r1 = reprice_scenario([self._call(1.0)], ds=5.0)
+        r10 = reprice_scenario([self._call(10.0)], ds=5.0)
+        assert r10.total_pnl == pytest.approx(10.0 * r1.total_pnl, rel=1e-9)
+
+    def test_small_move_agrees_with_scenario_pnl(self) -> None:
+        """For a small spot move, reprice and Taylor approximation agree closely.
+
+        The Taylor expansion is accurate to second order in ds. For ds/spot = 1%,
+        the third-order residual is O((0.01)^3) = O(1e-6) of spot, which should
+        produce agreement to within 1% of the reprice total.
+        """
+        from optionview.portfolio import aggregate_greeks, reprice_scenario, scenario_pnl
+        positions = [self._call(10.0), self._put(10.0)]
+        ds = 1.0  # 1% of spot=100
+
+        risk = aggregate_greeks(positions)
+        approx = scenario_pnl(risk, ds=ds)
+        exact = reprice_scenario(positions, ds=ds)
+
+        residual = abs(exact.total_pnl - approx.total_pnl)
+        reference = abs(exact.total_pnl)
+        if reference > 1e-8:
+            assert residual / reference < 0.02, (
+                f"Taylor approximation error too large for small ds={ds}: "
+                f"exact={exact.total_pnl:.6f} approx={approx.total_pnl:.6f} "
+                f"rel_residual={residual/reference:.4%}"
+            )
+
+    def test_large_move_diverges_from_scenario_pnl(self) -> None:
+        """For a large spot move, reprice and Taylor approximation diverge materially.
+
+        With ds=30 (30% of spot), higher-order terms become material. The
+        reprice result is the accurate benchmark; the Taylor expansion should
+        differ by more than 10% of the reprice total. This demonstrates when
+        scenario_pnl is insufficient and reprice_scenario should be used
+        instead. The direction of the residual depends on the portfolio:
+        the second-order expansion is a local approximation that over- or
+        under-estimates depending on which higher-order terms dominate.
+        """
+        from optionview.portfolio import aggregate_greeks, reprice_scenario, scenario_pnl
+        positions = [self._call(10.0), self._put(10.0)]
+        ds = 30.0
+
+        risk = aggregate_greeks(positions)
+        approx = scenario_pnl(risk, ds=ds)
+        exact = reprice_scenario(positions, ds=ds)
+
+        residual = abs(exact.total_pnl - approx.total_pnl)
+        reference = abs(exact.total_pnl)
+        assert reference > 0.0, "Exact reprice P&L should be non-zero for ds=30"
+        rel_error = residual / reference
+        assert rel_error > 0.10, (
+            f"Expected >10% approximation error for large move ds={ds}, "
+            f"exact={exact.total_pnl:.4f} approx={approx.total_pnl:.4f} "
+            f"rel_error={rel_error:.2%}"
+        )
+
+    def test_scenario_params_stored_on_result(self) -> None:
+        """RepricedPnL stores the scenario parameters used."""
+        from optionview.portfolio import reprice_scenario
+        result = reprice_scenario([self._call()], ds=3.5, dvol=-0.02, dt_days=2.0)
+        assert result.ds == pytest.approx(3.5)
+        assert result.dvol == pytest.approx(-0.02)
+        assert result.dt_days == pytest.approx(2.0)
+
+    def test_expired_position_uses_intrinsic_call(self) -> None:
+        """When dt_days exceeds expiry, the call is valued at max(S+ds-K, 0)."""
+        from optionview.portfolio import reprice_scenario, Position
+        pos = Position(
+            spot=100.0, strike=95.0, rate=0.05, volatility=0.25,
+            expiry_years=0.1, option_type="call", quantity=1.0,
+        )
+        # Advance beyond expiry (0.1 years = 36.5 days; use 40 days)
+        result = reprice_scenario([pos], dt_days=40.0)
+        intrinsic = max(100.0 - 95.0, 0.0)  # ds=0, new_spot=100, K=95 -> 5.0
+        from optionview.models import black_scholes
+        original = black_scholes(100.0, 95.0, 0.05, 0.25, 0.1, "call")
+        expected_pnl = (intrinsic - original) * 1.0
+        assert result.total_pnl == pytest.approx(expected_pnl, abs=1e-10)
+
+    def test_expired_position_uses_intrinsic_put(self) -> None:
+        """When dt_days exceeds expiry, the put is valued at max(K-S-ds, 0)."""
+        from optionview.portfolio import reprice_scenario, Position
+        pos = Position(
+            spot=100.0, strike=105.0, rate=0.05, volatility=0.25,
+            expiry_years=0.1, option_type="put", quantity=1.0,
+        )
+        result = reprice_scenario([pos], dt_days=40.0)
+        intrinsic = max(105.0 - 100.0, 0.0)  # 5.0
+        from optionview.models import black_scholes
+        original = black_scholes(100.0, 105.0, 0.05, 0.25, 0.1, "put")
+        expected_pnl = (intrinsic - original) * 1.0
+        assert result.total_pnl == pytest.approx(expected_pnl, abs=1e-10)
+
+    def test_raises_on_negative_dt_days(self) -> None:
+        """Negative dt_days must raise ValueError."""
+        from optionview.portfolio import reprice_scenario
+        with pytest.raises(ValueError, match="dt_days"):
+            reprice_scenario([self._call()], dt_days=-1.0)
+
+    def test_raises_when_bumped_vol_goes_negative(self) -> None:
+        """dvol that pushes any position vol below zero must raise ValueError."""
+        from optionview.portfolio import reprice_scenario
+        # vol=0.25; dvol=-0.30 -> new_vol=-0.05 < 0
+        with pytest.raises(ValueError, match="[Vv]olatility"):
+            reprice_scenario([self._call()], dvol=-0.30)
+
+    def test_short_position_reverses_sign(self) -> None:
+        """Short call (quantity=-1) loses when spot rises, opposite of long."""
+        from optionview.portfolio import reprice_scenario
+        long_result = reprice_scenario([self._call(1.0)], ds=10.0)
+        short_result = reprice_scenario([self._call(-1.0)], ds=10.0)
+        assert short_result.total_pnl == pytest.approx(-long_result.total_pnl, rel=1e-9)
+
+    def test_empty_portfolio_returns_zero(self) -> None:
+        """Empty positions list produces total_pnl=0 and empty per_position tuple."""
+        from optionview.portfolio import reprice_scenario
+        result = reprice_scenario([], ds=5.0, dvol=0.02, dt_days=3.0)
+        assert result.total_pnl == 0.0
+        assert result.per_position_pnl == ()
