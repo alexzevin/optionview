@@ -33,10 +33,11 @@ caution since they aggregate sensitivities to different spot prices.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 from optionview.greeks import compute_greeks
-from optionview.models import OptionType
+from optionview.models import OptionType, black_scholes
 
 
 _GREEK_KEYS: tuple[str, ...] = (
@@ -349,4 +350,166 @@ def aggregate_greeks(positions: list[Position]) -> PortfolioRisk:
         net_dollar_delta=net_dollar_delta,
         net_dollar_gamma=net_dollar_gamma,
         n_positions=len(positions),
+    )
+
+
+@dataclass(frozen=True)
+class RepricedPnL:
+    """Portfolio P&L from full Black-Scholes repricing under a market scenario.
+
+    Each position is repriced at shifted market conditions and P&L is computed
+    as (new_price - original_price) * quantity. This is the exact Black-Scholes
+    benchmark for the second-order Taylor approximation from scenario_pnl.
+
+    The Taylor approximation from scenario_pnl is accurate for small moves but
+    diverges from this benchmark for large spot moves (ds/spot above 5%),
+    vol jumps (|dvol| above 3 vol points), or long horizons (dt_days above 30).
+    Comparing total_pnl here against ScenarioPnL.total_pnl isolates the
+    higher-order residual that the Taylor expansion discards:
+
+        residual = reprice.total_pnl - approx.total_pnl
+
+    A residual near zero confirms the approximation is reliable for the given
+    move size. A large residual signals that higher-order convexity terms
+    (speed, color, vanna-of-vanna) are material and the full reprice should
+    be used instead.
+
+    Attributes:
+        per_position_pnl: P&L for each position in input order. Quantity
+            scaling is included: a long position of 10 contracts with a $2
+            unit gain contributes +20.0, not +2.0. Tuple preserves input
+            order so callers can zip against the original positions list.
+        total_pnl: Arithmetic sum of per_position_pnl.
+        ds: Spot shift applied (same units as Position.spot).
+        dvol: Implied vol shift applied (decimal, e.g. 0.01 for +1 vol point).
+        dt_days: Calendar days elapsed (non-negative).
+    """
+
+    per_position_pnl: tuple[float, ...]
+    total_pnl: float
+    ds: float
+    dvol: float
+    dt_days: float
+
+
+def reprice_scenario(
+    positions: list[Position],
+    ds: float = 0.0,
+    dvol: float = 0.0,
+    dt_days: float = 0.0,
+) -> RepricedPnL:
+    """Reprice each position under shifted market conditions using Black-Scholes.
+
+    Shifts spot by ds, each position's implied volatility by dvol, and reduces
+    each expiry by dt_days calendar days. Returns per-position and total P&L
+    as an exact Black-Scholes benchmark.
+
+    Unlike scenario_pnl (which uses a second-order Taylor expansion), this
+    function evaluates the full Black-Scholes formula at the bumped parameters
+    and is accurate to the extent that Black-Scholes prices positions
+    correctly. It is most useful for two purposes:
+
+      1. Validating that scenario_pnl is reliable for a given move size by
+         comparing the two totals. When they agree to within a few cents on a
+         typical equity option portfolio, the Taylor approximation is safe.
+
+      2. Replacing scenario_pnl for large stress scenarios where the expansion
+         accuracy is insufficient (ds/spot above 5%, |dvol| above 3 vol
+         points, or dt_days above 30).
+
+    The intended usage pattern is:
+
+        risk   = aggregate_greeks(positions)
+        approx = scenario_pnl(risk, ds=10.0, dvol=-0.03, dt_days=5.0)
+        exact  = reprice_scenario(positions, ds=10.0, dvol=-0.03, dt_days=5.0)
+        residual = exact.total_pnl - approx.total_pnl
+
+    Degenerate expiry handling: if dt_days pushes a position's remaining expiry
+    to zero or below, the new price is clamped to intrinsic value (discounting
+    is omitted for clarity at expiry). This avoids a ValueError from
+    black_scholes while preserving the correct terminal payoff.
+
+    Degenerate spot handling: if ds pushes spot to zero or below, calls are
+    priced at zero and puts at the discounted strike (the maximum put intrinsic).
+    This is an extreme edge case; real portfolios should not require it.
+
+    Args:
+        positions: List of Position objects defining the portfolio. Each
+            position's volatility is independently shifted by dvol, preserving
+            relative vol differences across positions under the scenario.
+        ds: Spot price shift in the same units as Position.spot. Positive for
+            a spot increase, negative for a decrease. Defaults to 0.
+        dvol: Implied vol shift in decimal units (e.g. 0.01 for +1 vol point,
+            -0.02 for -2 vol points). Applied uniformly to all positions.
+            Defaults to 0.
+        dt_days: Calendar days elapsed. Must be non-negative. Defaults to 0.
+
+    Returns:
+        RepricedPnL with per-position and total P&L under the scenario.
+
+    Raises:
+        ValueError: If dt_days is negative; or if the bumped volatility
+            (position.volatility + dvol) would go negative for any position,
+            which would make the Black-Scholes formula undefined.
+    """
+    if dt_days < 0:
+        raise ValueError(f"dt_days must be non-negative, got {dt_days}")
+
+    dt_years = dt_days / 365.0
+    per_pos: list[float] = []
+
+    for pos in positions:
+        new_vol = pos.volatility + dvol
+        if new_vol < 0.0:
+            label = pos.label or f"{pos.option_type} K={pos.strike}"
+            raise ValueError(
+                f"Bumped volatility is negative for position '{label}': "
+                f"{pos.volatility:.4f} + {dvol:.4f} = {new_vol:.4f}. "
+                f"Reduce |dvol| or verify position volatility inputs."
+            )
+
+        new_spot = pos.spot + ds
+        new_expiry = pos.expiry_years - dt_years
+
+        original_price = black_scholes(
+            spot=pos.spot,
+            strike=pos.strike,
+            rate=pos.rate,
+            volatility=pos.volatility,
+            expiry_years=pos.expiry_years,
+            option_type=pos.option_type,
+            dividend_yield=pos.dividend_yield,
+        )
+
+        if new_expiry <= 0.0:
+            # Option has expired: intrinsic value without discounting
+            if pos.option_type == "call":
+                new_price = max(new_spot - pos.strike, 0.0)
+            else:
+                new_price = max(pos.strike - new_spot, 0.0)
+        elif new_spot <= 0.0:
+            # Spot has reached zero: calls are worthless, puts pay max(K, 0)
+            if pos.option_type == "call":
+                new_price = 0.0
+            else:
+                new_price = pos.strike * math.exp(-pos.rate * new_expiry)
+        else:
+            new_price = black_scholes(
+                spot=new_spot,
+                strike=pos.strike,
+                rate=pos.rate,
+                volatility=new_vol,
+                expiry_years=new_expiry,
+                option_type=pos.option_type,
+                dividend_yield=pos.dividend_yield,
+            )
+
+        per_pos.append((new_price - original_price) * pos.quantity)
+
+    return RepricedPnL(
+        per_position_pnl=tuple(per_pos),
+        total_pnl=sum(per_pos),
+        ds=ds,
+        dvol=dvol,
+        dt_days=dt_days,
     )
