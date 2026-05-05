@@ -12,6 +12,7 @@ A Python toolkit for comparing option pricing models against real-time market da
 - **Implied Volatility Solver**: Newton-Raphson IV solver with configurable tolerance
 - **Portfolio Greeks Aggregation**: Aggregate Greeks across a collection of long and short option positions, with per-position and net portfolio risk
 - **Scenario P&L**: Estimate portfolio P&L for a simultaneous move in spot, implied vol, and time using a second-order Taylor expansion (delta, gamma, vega, theta, vanna, charm, volga), useful for stress testing and what-if analysis without a full reprice
+- **Full Repricing Benchmark**: Exact Black-Scholes repricing of all positions under a shifted scenario, with per-position P&L breakdown; serves as the ground-truth benchmark for validating the Taylor approximation from Scenario P&L
 - **Clean API**: Simple, composable functions for scripting and analysis
 
 ## Installation
@@ -610,6 +611,61 @@ reliable. The expansion does not capture higher-order spot terms (speed, color) 
 carry effects, so it works best for short-horizon stress scenarios. The included
 volga term improves vol-move accuracy relative to a pure first-order vega estimate,
 particularly for OTM positions experiencing vol expansion.
+
+## Scenario Repricing
+
+`reprice_scenario` provides an exact Black-Scholes benchmark for `scenario_pnl`. Instead of a
+Taylor expansion, it reprices each position at the bumped market parameters and returns the
+actual P&L from the full formula. This has two primary uses:
+
+1. **Validation**: confirm that `scenario_pnl` is reliable for a given move size by comparing
+   the two totals. When they agree closely, the Taylor approximation is safe to use.
+2. **Large move accuracy**: replace `scenario_pnl` for stress scenarios where the expansion
+   breaks down (spot moves above 5%, vol jumps larger than 3 vol points, or horizons above 30
+   calendar days).
+
+The residual between the two methods isolates the higher-order convexity terms (speed, color)
+that the second-order expansion discards:
+
+```python
+from optionview.portfolio import Position, aggregate_greeks, scenario_pnl, reprice_scenario
+
+positions = [
+    Position(spot=100, strike=100, rate=0.05, volatility=0.25,
+             expiry_years=0.25, option_type="call", quantity=10),
+    Position(spot=100, strike=100, rate=0.05, volatility=0.25,
+             expiry_years=0.25, option_type="put", quantity=10),
+]
+
+risk = aggregate_greeks(positions)
+
+# A large move: spot up $10, vol drops 3 points, 5 days pass
+ds, dvol, dt = 10.0, -0.03, 5.0
+
+approx = scenario_pnl(risk, ds=ds, dvol=dvol, dt_days=dt)
+exact  = reprice_scenario(positions, ds=ds, dvol=dvol, dt_days=dt)
+
+residual = exact.total_pnl - approx.total_pnl
+
+print(f"Taylor approx P&L: {approx.total_pnl:+.4f}")
+print(f"Full reprice P&L:   {exact.total_pnl:+.4f}")
+print(f"Higher-order residual: {residual:+.4f}")
+
+# Per-position breakdown from the full reprice
+for i, pnl in enumerate(exact.per_position_pnl):
+    pos = positions[i]
+    label = pos.label or f"{pos.option_type} K={pos.strike}"
+    print(f"  [{label}]: {pnl:+.4f}")
+```
+
+`reprice_scenario` applies `dvol` uniformly to each position's implied volatility. If the bumped
+vol would go negative for any position, it raises `ValueError` immediately. For the degenerate
+case where `dt_days` pushes an expiry to zero, the function returns intrinsic value rather than
+raising an error, so stress tests covering expiry boundaries behave predictably.
+
+The `RepricedPnL` object carries `per_position_pnl` as a tuple in input order, so it can be
+zipped against the original positions list to attribute P&L by leg. The `total_pnl` is the
+arithmetic sum and matches the quantity scaling applied to each contract.
 
 ## Project Structure
 
