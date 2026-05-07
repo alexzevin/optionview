@@ -5,6 +5,7 @@ A Python toolkit for comparing option pricing models against real-time market da
 ## Features
 
 - **Multiple Pricing Models**: Black-Scholes, Binomial Tree, Monte Carlo simulation, Heston stochastic volatility, and SABR (Hagan et al. 2002)
+- **Model Calibration**: Fit Heston (all five parameters) or SABR (alpha, rho, nu with fixed beta) to an observed implied vol smile via scipy L-BFGS-B optimization
 - **Live Market Data**: Fetches real-time option chains from Yahoo Finance (no API key required)
 - **Model Comparison**: Side-by-side comparison of theoretical vs. market prices
 - **Volatility Surface Construction**: Builds an implied volatility surface from multi-expiry option chains, with per-expiry smile analysis (OLS slope and IV range), ATM term structure extraction, log-moneyness normalized IVPoints, piecewise-linear IV interpolation across strikes, and implied forward volatility extraction with calendar spread arbitrage detection
@@ -518,6 +519,104 @@ rather than decimal form (0.25). The optimizer will converge, but alpha will be 
 100 times too large, and RMSE will be reported in the same percentage-form units. Always verify
 that input market_iv values are decimals before calling `calibrate_sabr`.
 
+## Heston Calibration
+
+Given an observed implied vol smile, `calibrate_heston` fits all five Heston model
+parameters (v0, kappa, theta, sigma, rho) to market quotes. It takes the same
+(forward, strike, expiry_years, market_iv) interface as `calibrate_sabr` and can
+accept quotes across multiple expiries simultaneously, giving the optimizer
+information about both smile shape and term structure at once.
+
+Unlike SABR, which fits a three-parameter slice analytically, Heston requires
+numerical integration per quote per optimizer iteration. Calibration is slower
+(10-60 seconds for a 10-strike slice), but the fitted model is fully consistent
+with the Heston pricing function and can be used directly for simulation or
+structured product pricing. For fast calibration to a single expiry, `calibrate_sabr`
+remains the practical choice.
+
+```python
+import math
+from optionview.fetcher import fetch_option_chain, fetch_spot_price
+from optionview.surface import build_surface
+from optionview.models import calibrate_heston, heston
+
+ticker = "SPY"
+records = fetch_option_chain(ticker)
+spot = fetch_spot_price(ticker)
+rate = 0.05
+div_yield = 0.013
+
+surface = build_surface(records, spot, rate, div_yield, min_open_interest=50)
+exp = surface.expirations[0]
+
+t = next(p.expiry_years for p in surface.smile(exp))
+forward = spot * math.exp((rate - div_yield) * t)
+
+# Build (forward, strike, expiry_years, market_iv) tuples from one smile slice
+quotes = [
+    (forward, p.strike, p.expiry_years, p.iv)
+    for p in surface.smile(exp)
+]
+
+fit = calibrate_heston(quotes)
+
+print(f"Fitted parameters for {exp}:")
+print(f"  v0    = {fit.v0:.4f}  (initial variance: {math.sqrt(fit.v0):.1%} initial vol)")
+print(f"  kappa = {fit.kappa:.4f}  (mean-reversion speed)")
+print(f"  theta = {fit.theta:.4f}  (long-run variance: {math.sqrt(fit.theta):.1%} long-run vol)")
+print(f"  sigma = {fit.sigma:.4f}  (vol-of-vol)")
+print(f"  rho   = {fit.rho:.4f}  (spot-variance correlation)")
+print(f"  RMSE  = {fit.rmse:.4f}  ({fit.rmse * 100:.2f} vol points)")
+print(f"  max_abs_error = {fit.max_abs_error:.4f}")
+print(f"  Feller condition satisfied: {fit.feller_satisfied}")
+```
+
+The Feller condition (2 * kappa * theta > sigma^2) ensures the variance process
+stays strictly positive. When it is violated, v(t) can touch zero for long
+expiries, which reduces the precision of the Gil-Pelaez integration. The fitted
+parameters still produce valid prices, but interpret results carefully when
+`feller_satisfied` is False.
+
+Once calibrated, use the fitted parameters directly with `heston` to price
+options at any strike, including strikes not in the original chain:
+
+```python
+for strike in [380, 400, 420, 440, 460, 480, 500, 520]:
+    call = heston(
+        spot=spot, strike=strike, rate=rate, expiry_years=t,
+        v0=fit.v0, kappa=fit.kappa, theta=fit.theta,
+        sigma=fit.sigma, rho=fit.rho,
+        option_type="call", dividend_yield=div_yield,
+    )
+    print(f"  K={strike}: call=${call:.4f}")
+```
+
+For multi-expiry calibration, pass quotes from all available smile slices together.
+The optimizer fits a single set of parameters that is consistent with both the smile
+shape and the term structure, which gives more stable results than fitting each
+expiry independently when the available quotes per slice are sparse:
+
+```python
+all_quotes = []
+for exp in surface.expirations:
+    t_exp = next(p.expiry_years for p in surface.smile(exp))
+    fwd_exp = spot * math.exp((rate - div_yield) * t_exp)
+    for p in surface.smile(exp):
+        all_quotes.append((fwd_exp, p.strike, p.expiry_years, p.iv))
+
+fit_joint = calibrate_heston(
+    all_quotes,
+    v0_init=fit.v0,      # warm-start from single-expiry fit
+    rho_init=fit.rho,
+)
+print(f"Joint fit: RMSE={fit_joint.rmse:.4f}  rho={fit_joint.rho:.3f}")
+```
+
+A common calibration failure is supplying market IVs in percentage form (e.g. 25.0)
+instead of decimal form (0.25). The optimizer will converge, but the reported
+RMSE will be approximately 100 times too large and `calibrate_heston` will raise
+a RuntimeError. Always verify input market_iv values are decimals before calling.
+
 ## Portfolio Greeks
 
 Aggregate Greeks across a collection of option positions to compute net portfolio
@@ -696,6 +795,9 @@ A two-factor model where variance follows a mean-reverting CIR process correlate
 
 ### SABR Stochastic Volatility
 A two-factor model where the instantaneous vol follows a lognormal process correlated with the forward price. The Hagan et al. (2002) analytical approximation gives implied Black-Scholes vol without numerical integration, making it the industry standard for fast calibration to option smile slices. The beta parameter controls the CEV backbone: beta=1 is lognormal (equities/FX), beta=0 is normal (rates).
+
+### Heston and SABR Calibration
+Both models can be calibrated to observed market implied vols. `calibrate_sabr` fits three parameters (alpha, rho, nu with beta fixed) to a single-expiry slice using a direct IV-space objective. `calibrate_heston` fits all five Heston parameters and accepts quotes across multiple expiries, using a price-space objective for efficiency. Both return structured result objects with RMSE and per-strike max error.
 
 ## Roadmap
 
