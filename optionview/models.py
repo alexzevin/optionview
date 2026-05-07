@@ -939,3 +939,283 @@ def calibrate_sabr(
         max_abs_error=max_abs,
         n_points=n,
     )
+
+
+# ---------------------------------------------------------------------------
+# Heston calibration: fit all five parameters to a market-implied vol slice
+# ---------------------------------------------------------------------------
+
+
+@_dataclass(frozen=True)
+class HestonCalibration:
+    """Fitted Heston model parameters from calibrating to market implied volatilities.
+
+    Attributes:
+        v0: Fitted initial variance. The initial implied vol level is approximately
+            sqrt(v0). For a 20% vol environment, expect v0 near 0.04.
+        kappa: Fitted mean-reversion speed for the variance process. Higher kappa
+            means variance reverts to theta faster. Typical equity values are 1-5.
+        theta: Fitted long-run variance. The long-run implied vol is approximately
+            sqrt(theta). For equity indices with 15-25% realized vol, expect
+            theta near 0.02-0.06.
+        sigma: Fitted vol-of-vol (volatility of the variance process). Controls
+            smile curvature. Typical equity values are 0.2-0.8.
+        rho: Fitted spot-variance correlation. Negative values produce the
+            downward-sloping skew typical of equity index options.
+            Equity indices typically calibrate rho in (-0.9, -0.3).
+        rmse: Root mean squared error between Heston-implied IVs and input market
+            IVs, in decimal vol units (e.g. 0.005 = 0.5 vol-point RMSE).
+        max_abs_error: Largest single-strike absolute IV error in decimal vol.
+            Useful for identifying strikes the model cannot fit well.
+        n_points: Number of market quotes used in calibration.
+        feller_satisfied: Whether the Feller condition (2 * kappa * theta > sigma^2)
+            holds for the fitted parameters. When True, the variance process stays
+            strictly positive. When False, v(t) can touch zero, reducing numerical
+            precision for long expiries.
+    """
+
+    v0: float
+    kappa: float
+    theta: float
+    sigma: float
+    rho: float
+    rmse: float
+    max_abs_error: float
+    n_points: int
+    feller_satisfied: bool
+
+
+def calibrate_heston(
+    market_quotes: "_Sequence[tuple[float, float, float, float]]",
+    v0_init: float = 0.04,
+    kappa_init: float = 2.0,
+    theta_init: float = 0.04,
+    sigma_init: float = 0.3,
+    rho_init: float = -0.5,
+) -> "HestonCalibration":
+    """Fit all five Heston model parameters to observed Black-Scholes implied volatilities.
+
+    Minimizes the sum of squared price errors between Heston model prices and
+    market prices derived from the input implied volatilities:
+
+        min_{v0, kappa, theta, sigma, rho}
+            sum_i [HestonPrice(F_i, K_i, T_i; params) - Black76Price(F_i, K_i, T_i; iv_i)]^2
+
+    The objective uses price space (not IV space) to avoid the computational cost
+    of a nested IV solve per optimizer iteration. After convergence, IV-space errors
+    are computed once at the fitted parameters for reporting.
+
+    Unlike SABR, which uses a closed-form IV approximation, Heston pricing requires
+    numerical integration (Gil-Pelaez characteristic function inversion) per quote
+    per optimizer iteration. Calibration is therefore slower than SABR for the same
+    number of quotes. For a 10-strike smile slice, expect 10-60 seconds depending
+    on integration tolerance and optimizer convergence speed.
+
+    The Heston calibration surface is non-convex and the L-BFGS-B optimizer finds
+    a local minimum from the supplied initial guess. For high-quality fits, consider
+    running from multiple starting points (different v0_init and rho_init values)
+    and selecting the result with the lowest RMSE. A common starting strategy is to
+    set v0_init = theta_init = (ATM_vol)^2 for the nearest expiry.
+
+    The pricing convention follows Black-76: each quote is represented as
+    (forward, strike, expiry_years, market_iv) where forward = S * exp((r - q) * T).
+    Heston is priced with rate=0 and spot=forward, which is correct under the
+    forward measure and consistent with the calibrate_sabr interface.
+
+    Unlike calibrate_sabr, which calibrates to a single expiry slice, calibrate_heston
+    accepts quotes across multiple expiries. The Heston model prices each (T, K) pair
+    independently via its characteristic function, so mixing expiries gives the
+    optimizer more information about both the smile shape and term structure
+    simultaneously.
+
+    Args:
+        market_quotes: Sequence of (forward, strike, expiry_years, market_iv) tuples.
+            forward is the risk-neutral forward price for each expiry:
+            F = S * exp((r - q) * T). market_iv must be a positive decimal
+            (e.g. 0.25 for 25% implied vol). Quotes may span multiple expiries.
+        v0_init: Initial guess for v0 (initial variance). A reasonable starting
+            point is the square of the ATM implied vol for the nearest expiry.
+            Defaults to 0.04 (equivalent to a 20% initial vol).
+        kappa_init: Initial guess for the mean-reversion speed. Defaults to 2.0.
+        theta_init: Initial guess for the long-run variance. Setting theta_init
+            equal to v0_init is a natural starting point when the variance process
+            is near its long-run level. Defaults to 0.04.
+        sigma_init: Initial guess for vol-of-vol. Defaults to 0.3.
+        rho_init: Initial guess for spot-variance correlation. Defaults to -0.5,
+            which reflects mild negative skew typical of equity index options.
+
+    Returns:
+        HestonCalibration with fitted parameters and IV-space fit quality metrics.
+
+    Raises:
+        ValueError: If market_quotes is empty, or if any quote contains a
+            non-positive forward, strike, expiry_years, or market_iv.
+        RuntimeError: If the optimizer converges to a fit with RMSE above 5%
+            (500 bps), indicating a genuine calibration failure. Common causes:
+            very sparse quote coverage, market_iv values in percentage form
+            (e.g. 25.0 instead of 0.25), or a market regime that requires
+            better initial guesses.
+
+    Example:
+        Calibrate to a near-dated SPY smile slice::
+
+            from optionview.fetcher import fetch_option_chain, fetch_spot_price
+            from optionview.surface import build_surface
+            from optionview.models import calibrate_heston
+            import math
+
+            records = fetch_option_chain("SPY")
+            spot = fetch_spot_price("SPY")
+            rate = 0.05
+            div_yield = 0.013
+
+            surface = build_surface(records, spot, rate, div_yield, min_open_interest=50)
+            exp = surface.expirations[0]
+            t = next(p.expiry_years for p in surface.smile(exp))
+            forward = spot * math.exp((rate - div_yield) * t)
+
+            quotes = [
+                (forward, p.strike, p.expiry_years, p.iv)
+                for p in surface.smile(exp)
+            ]
+
+            fit = calibrate_heston(quotes)
+            print(f"v0={fit.v0:.4f}  kappa={fit.kappa:.4f}  theta={fit.theta:.4f}")
+            print(f"sigma={fit.sigma:.4f}  rho={fit.rho:.4f}")
+            print(f"RMSE={fit.rmse:.4f}  max_err={fit.max_abs_error:.4f}")
+            print(f"Feller condition satisfied: {fit.feller_satisfied}")
+    """
+    if not market_quotes:
+        raise ValueError("market_quotes must be non-empty.")
+
+    for i, (fwd, k, t, iv) in enumerate(market_quotes):
+        if fwd <= 0.0:
+            raise ValueError(f"market_quotes[{i}]: forward must be positive, got {fwd}")
+        if k <= 0.0:
+            raise ValueError(f"market_quotes[{i}]: strike must be positive, got {k}")
+        if t <= 0.0:
+            raise ValueError(f"market_quotes[{i}]: expiry_years must be positive, got {t}")
+        if iv <= 0.0:
+            raise ValueError(f"market_quotes[{i}]: market_iv must be positive, got {iv}")
+
+    n = len(market_quotes)
+
+    # Pre-compute Black-76 market call prices from market IVs once.
+    # Setting rate=0 with spot=forward converts black_scholes to Black-76:
+    #   C = forward * N(d1) - strike * N(d2)
+    # This is the forward-measure pricing convention that matches Heston at rate=0.
+    market_prices: list[float] = [
+        black_scholes(fwd, k, 0.0, iv, t, "call")
+        for fwd, k, t, iv in market_quotes
+    ]
+
+    # Price-space penalty for parameter regions where Heston pricing raises an
+    # exception. Set to 1.0 (roughly the full price of a near-ATM option at
+    # typical strike/vol/expiry combinations), which strongly steers the optimizer
+    # away from degenerate regions without dominating the loss landscape.
+    _PRICE_PENALTY = 1.0
+
+    def _objective(params: "np.ndarray") -> float:
+        v0_, kappa_, theta_, sigma_, rho_ = (
+            float(params[0]),
+            float(params[1]),
+            float(params[2]),
+            float(params[3]),
+            float(params[4]),
+        )
+        sse = 0.0
+        for (fwd, k, t, _), mkt_price in zip(market_quotes, market_prices):
+            try:
+                h_price = heston(
+                    spot=fwd,
+                    strike=k,
+                    rate=0.0,
+                    expiry_years=t,
+                    v0=v0_,
+                    kappa=kappa_,
+                    theta=theta_,
+                    sigma=sigma_,
+                    rho=rho_,
+                    option_type="call",
+                )
+                sse += (h_price - mkt_price) ** 2
+            except Exception:
+                sse += _PRICE_PENALTY ** 2
+        return sse
+
+    bounds = [
+        (1e-6, 4.0),     # v0: variance; 4.0 corresponds to 200% vol (extreme upper bound)
+        (0.1, 20.0),     # kappa: mean-reversion speed
+        (1e-6, 4.0),     # theta: long-run variance
+        (0.05, 3.0),     # sigma: vol-of-vol; lower bound prevents CF degeneracy
+        (-0.999, 0.999), # rho: spot-variance correlation
+    ]
+
+    x0 = np.array([v0_init, kappa_init, theta_init, sigma_init, rho_init])
+    for idx, (lo, hi) in enumerate(bounds):
+        x0[idx] = float(np.clip(x0[idx], lo, hi))
+
+    result = _optimize.minimize(
+        _objective,
+        x0=x0,
+        method="L-BFGS-B",
+        bounds=bounds,
+        options={"ftol": 1e-12, "gtol": 1e-7, "maxiter": 3000},
+    )
+
+    v0_fit = float(result.x[0])
+    kappa_fit = float(result.x[1])
+    theta_fit = float(result.x[2])
+    sigma_fit = float(result.x[3])
+    rho_fit = float(result.x[4])
+
+    # Compute IV-space errors at the fitted parameters.
+    # The price-space objective is numerically efficient during optimization;
+    # vol-point errors are more interpretable for users inspecting fit quality.
+    errors: list[float] = []
+    for fwd, k, t, market_iv in market_quotes:
+        try:
+            h_price = heston(
+                spot=fwd,
+                strike=k,
+                rate=0.0,
+                expiry_years=t,
+                v0=v0_fit,
+                kappa=kappa_fit,
+                theta=theta_fit,
+                sigma=sigma_fit,
+                rho=rho_fit,
+                option_type="call",
+            )
+            h_iv = implied_volatility(h_price, fwd, k, 0.0, t, "call")
+            errors.append(abs(h_iv - market_iv))
+        except (ValueError, RuntimeError):
+            errors.append(float(_PRICE_PENALTY))
+
+    rmse = float(_math.sqrt(sum(e ** 2 for e in errors) / n))
+    max_abs = float(max(errors))
+
+    # 5% (500 bps) RMSE threshold: beyond this, the calibration has failed in a
+    # meaningful way. Normal L-BFGS-B convergence noise is well below this level.
+    if rmse > 0.05:
+        raise RuntimeError(
+            f"Heston calibration did not converge to an acceptable fit: "
+            f"RMSE={rmse:.4f} (threshold=0.05). Verify that market_iv values "
+            f"are in decimal form (e.g. 0.25, not 25) and that the quote set "
+            f"spans a liquid strike range. Consider supplying better initial "
+            f"guesses via v0_init and rho_init for the target market."
+        )
+
+    feller = 2.0 * kappa_fit * theta_fit > sigma_fit ** 2
+
+    return HestonCalibration(
+        v0=v0_fit,
+        kappa=kappa_fit,
+        theta=theta_fit,
+        sigma=sigma_fit,
+        rho=rho_fit,
+        rmse=rmse,
+        max_abs_error=max_abs,
+        n_points=n,
+        feller_satisfied=feller,
+    )
